@@ -1,0 +1,5 @@
+venv/
+.env
+neo4j_data/
+__pycache__/
+.idea/

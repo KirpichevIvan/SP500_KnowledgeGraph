@@ -1,0 +1,8 @@
+pandas
+yfinance
+requests
+openpyxl
+lxml
+openai
+neo4j
+python-dotenv
