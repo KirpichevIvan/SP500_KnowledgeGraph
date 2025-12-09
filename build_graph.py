@@ -80,6 +80,11 @@ def ask_llm_for_details(row):
         print(f"⚠️ Ошибка LLM для {name}: {e}")
         return {}
 
+def clear_database(session):
+    """Полная очистка базы перед новой загрузкой"""
+    print("Очищаем базу данных...")
+    session.run("MATCH (n) DETACH DELETE n")
+    print("База пуста и готова к работе.")
 
 def build_graph(session, row, llm_data):
     ticker = row['Ticker']
@@ -139,22 +144,25 @@ def build_graph(session, row, llm_data):
     sector = row.get('Sector')
     industry = row.get('Industry')
 
-    if sector and sector != 'N/A':
+    if industry and industry != 'N/A' and sector and sector != 'N/A':
         session.run("""
-            MATCH (c:Company {ticker: $ticker})
-            MERGE (s:Sector {name: $sector})
-            MERGE (c)-[:OPERATES_IN_SECTOR]->(s)
-        """, ticker=ticker, sector=sector)
+                MATCH (c:Company {ticker: $ticker})
+                MERGE (i:Industry {name: $industry})
+                MERGE (s:Sector {name: $sector})
 
-    if industry and industry != 'N/A':
+                // 1. Компания входит в Индустрию (Подсектор)
+                MERGE (c)-[:OPERATES_IN_INDUSTRY]->(i)
+
+                // 2. Индустрия входит в Сектор
+                MERGE (i)-[:PART_OF]->(s)
+            """, ticker=ticker, industry=industry, sector=sector)
+
+    elif sector and sector != 'N/A':
         session.run("""
-            MATCH (c:Company {ticker: $ticker})
-            MERGE (i:Industry {name: $industry})
-            MERGE (c)-[:OPERATES_IN_INDUSTRY]->(i)
-            WITH i
-            MATCH (s:Sector {name: $sector})
-            MERGE (i)-[:PART_OF]->(s)
-        """, ticker=ticker, industry=industry, sector=sector)
+                MATCH (c:Company {ticker: $ticker})
+                MERGE (s:Sector {name: $sector})
+                MERGE (c)-[:OPERATES_IN_SECTOR]->(s)
+            """, ticker=ticker, sector=sector)
 
     # ЛЮДИ
     try:
@@ -233,6 +241,8 @@ def main():
     df = df.head(20)
 
     with driver.session() as session:
+        clear_database(session)
+
         session.run("CREATE INDEX company_ticker IF NOT EXISTS FOR (c:Company) ON (c.ticker)")
         session.run("CREATE INDEX person_name IF NOT EXISTS FOR (p:Person) ON (p.name)")
         session.run("CREATE INDEX fund_name IF NOT EXISTS FOR (f:Fund) ON (f.name)")
