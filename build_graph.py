@@ -1,18 +1,21 @@
 import pandas as pd
 import json
 import os
-from openai import OpenAI
+import ollama
+from typing import List, Optional
+from pydantic import BaseModel, Field
 from neo4j import GraphDatabase
 from dotenv import load_dotenv
 import wikipedia
 from rapidfuzz import process, fuzz
 
+# Загрузка переменных окружения
 load_dotenv()
 
-POLZA_KEY = os.getenv("POLZA_API_KEY")
-NEO4J_URI = os.getenv("NEO4J_URI")
-NEO4J_USER = os.getenv("NEO4J_USERNAME")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
+# Настройки Neo4j
+NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+NEO4J_USER = os.getenv("NEO4J_USERNAME", "neo4j")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
 
 client = OpenAI(api_key=POLZA_KEY, base_url="https://api.polza.ai/api/v1")
 driver = GraphDatabase.driver(
@@ -83,20 +86,16 @@ def clean_money(value):
     try:
         if pd.isna(value) or value == 'N/A' or value == '':
             return None
-
         cleaned_val = float(value)
-
         if pd.isna(cleaned_val):
             return None
-
         return cleaned_val
     except:
         return None
 
-
-def ask_llm_for_details(row):
+def ask_llm_for_details(row) -> dict:
     """
-    Просим LLM структурировать неструктурированный текст описания.
+    Использует Ollama для извлечения структурированных данных.
     """
     name = row['Name']
     desc = str(row['Description'])[:800]
@@ -200,28 +199,24 @@ def build_graph(session, row, llm_data):
             query_geo = """
             MATCH (c:Company {ticker: $ticker})
 
-            // 1. Создаем Город и Страну (они есть почти всегда)
             MERGE (city:City {name: $city})
             MERGE (cntry:Country {name: $country})
-
-            // 2. Связываем Компанию с Городом
             MERGE (c)-[:LOCATED_IN]->(city)
 
-            // 3. Логика со Штатом (он есть не у всех стран)
             FOREACH (ignoreMe IN CASE WHEN $state IS NOT NULL AND $state <> 'N/A' THEN [1] ELSE [] END |
                 MERGE (s:State {name: $state})
                 MERGE (city)-[:IN_STATE]->(s)
                 MERGE (s)-[:IN_COUNTRY]->(cntry)
             )
 
-            // 4. Если Штата нет, связываем Город напрямую со Страной
             FOREACH (ignoreMe IN CASE WHEN $state IS NULL OR $state = 'N/A' THEN [1] ELSE [] END |
                 MERGE (city)-[:IN_COUNTRY]->(cntry)
             )
             """
             session.run(query_geo, ticker=ticker, city=city, state=state, country=country)
     except Exception as e:
-        print(f"Geodata error: {e}")
+        # print(f"Geodata warning: {e}") 
+        pass
 
     # ИЕРАРХИЯ
     sector = row.get('Sector')
@@ -274,7 +269,17 @@ def build_graph(session, row, llm_data):
     except:
         pass
 
-    # LLM DATA
+    # LLM DATA (Интеграция данных от Ollama)
+    
+    # Вспомогательная функция для чистой вставки
+    def merge_relation(item_list, node_label, rel_type):
+        for item in item_list:
+            if item and isinstance(item, str):
+                session.run(f"""
+                    MATCH (c:Company {{ticker: $ticker}})
+                    MERGE (n:{node_label} {{name: $name}})
+                    MERGE (c)-[:{rel_type}]->(n)
+                """, ticker=ticker, name=item)
 
     # Продукты
     for prod in llm_data.get('products', []):
@@ -323,8 +328,11 @@ def build_graph(session, row, llm_data):
 
 
 def main():
-    print("Загружаем Excel...")
-    df = pd.read_excel('data/sp500_graph_ready.xlsx')
+    # Проверка наличия файла
+    file_path = './data/sp500_graph_ready.xlsx'
+    if not os.path.exists(file_path):
+        print(f"Файл {file_path} не найден.")
+        return
 
     load_sp500_whitelist(df)
 
@@ -350,7 +358,6 @@ def main():
 
     driver.close()
     print("Граф успешно построен!")
-
 
 if __name__ == '__main__':
     main()
