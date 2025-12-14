@@ -6,6 +6,8 @@ from typing import List, Optional
 from pydantic import BaseModel, Field
 from neo4j import GraphDatabase
 from dotenv import load_dotenv
+import wikipedia
+from rapidfuzz import process, fuzz
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -15,21 +17,66 @@ NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USERNAME", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
 
-# Настройки Ollama
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma3:4b")
-OLLAMA_URL = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+client = OpenAI(api_key=POLZA_KEY, base_url="https://api.polza.ai/api/v1")
+driver = GraphDatabase.driver(
+    NEO4J_URI,
+    auth=(NEO4J_USER, NEO4J_PASSWORD),
+    max_connection_lifetime=200,
+    keep_alive=True
+)
 
-# Инициализация драйвера Neo4j
-driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+SP500_MAPPING = {}
 
-# --- Pydantic модели для Structured Output ---
-# Это определяет схему, которой ОБЯЗАНА следовать модель
-class CompanyDetails(BaseModel):
-    products: List[str] = Field(default_factory=list, description="Ключевые продукты, бренды или технологии")
-    markets: List[str] = Field(default_factory=list, description="Рынки или сферы деятельности")
-    subsidiaries: List[str] = Field(default_factory=list, description="Дочерние компании или приобретенные бренды")
-    partners: List[str] = Field(default_factory=list, description="Упомянутые партнеры")
-    competitors: List[str] = Field(default_factory=list, description="Упомянутые конкуренты")
+def load_sp500_whitelist(df):
+    """Загружает список компаний"""
+    global SP500_MAPPING
+    SP500_MAPPING = pd.Series(df.Ticker.values, index=df.Name).to_dict()
+    print(f"список S&P 500 загружен: {len(SP500_MAPPING)} компаний.")
+
+def find_sp500_ticker(company_name):
+    """Ищет компанию в списке S&P 500"""
+    if not company_name or not isinstance(company_name, str): return None
+
+    if company_name in SP500_MAPPING: return SP500_MAPPING[company_name]
+
+    try:
+        match = process.extractOne(company_name, SP500_MAPPING.keys(), scorer=fuzz.token_sort_ratio)
+        if match:
+            best_name, score, _ = match
+            if score > 85: return SP500_MAPPING[best_name]
+    except:
+        pass
+    return None
+
+
+def get_wiki_intel(company_name):
+    """
+    Ищет страницу компании в Википедии и берет оттуда текст.
+    """
+    try:
+        search_results = wikipedia.search(f"{company_name} company")
+
+        if not search_results:
+            return ""
+
+        page_title = search_results[0]
+
+        page = wikipedia.page(page_title, auto_suggest=False)
+
+        print(f"Готово: {page.content[:2000]}")
+
+        return f"Wikipedia Title: {page.title}\nContent: {page.content[:2000]}"
+
+    except wikipedia.exceptions.DisambiguationError as e:
+        try:
+            page = wikipedia.page(e.options[0], auto_suggest=False)
+            print(f"Готово: {page.content[:2000]}")
+            return f"Wikipedia Title: {page.title}\nContent: {page.content[:2000]}"
+        except:
+            return ""
+    except Exception as e:
+        print(f"   ⚠️ Wiki Error: {e}")
+        return ""
 
 def clean_money(value):
     """
@@ -51,42 +98,75 @@ def ask_llm_for_details(row) -> dict:
     Использует Ollama для извлечения структурированных данных.
     """
     name = row['Name']
-    desc = str(row['Description'])[:1500]
+    desc = str(row['Description'])[:800]
 
+    wiki_data = get_wiki_intel(name)
+    if wiki_data:
+        print(f"   📖 Wiki found: {wiki_data.splitlines()[0]}")
+    else:
+        print(f"   ⚠️ Wiki not found, using only Yahoo desc.")
     prompt = f"""
-    Проанализируй описание компании "{name}".
-    Текст: {desc}
+    Context about company "{name}":
+    1. Official Description: {desc}
+    2. Web Search Results: {wiki_data}
+
+    Task: Extract structured lists of entities based on the context.
     
-    Извлеки информацию о продуктах, рынках, дочерних компаниях, партнерах и конкурентах.
-    Будь точен. Если информации нет, оставляй список пустым.
+    CRITICAL RULES:
+    1. OUTPUT MUST BE IN ENGLISH ONLY. Translate if the source is not English.
+    2. "products": Extract specific product names (e.g. "Windows", "Tylenol") or key service categories.
+    3. "competitors": Extract specific company names.
+    4. "partners": Extract specific company names mentioned as partners or suppliers.
+    
+    Return ONLY JSON. No markdown. No comments.
+    Format: {{ "products": [...], "competitors": [...], "partners": [...] }}
     """
 
     try:
-        # Использование client.chat с параметром format (schema)
-        # Это заставляет модель генерировать JSON строго по схеме Pydantic
-        response = ollama.chat(
-            model=OLLAMA_MODEL,
-            messages=[
-                {'role': 'system', 'content': 'Ты аналитик данных. Извлекай сущности строго по схеме JSON.'},
-                {'role': 'user', 'content': prompt},
-            ],
-            format=CompanyDetails.model_json_schema(),
-            options={'temperature': 0.0}
+        completion = client.chat.completions.create(
+            model='qwen/qwen-2.5-7b-instruct',
+            messages=[{'role': 'user', 'content': prompt}],
+            temperature=0.0
         )
+        content = completion.choices[0].message.content
 
-        json_str = response['message']['content']
-        
-        # Валидация через Pydantic (превращает JSON строку в объект Python)
-        details = CompanyDetails.model_validate_json(json_str)
-        
-        # Возвращаем как словарь для совместимости с остальным кодом
-        return details.model_dump()
+        content = content.replace("```json", "").replace("```", "").strip()
+        if "{" in content:
+            content = content[content.find("{"):content.rfind("}") + 1]
 
+        data = json.loads(content)
+
+        prods = len(data.get('products', []))
+        comps = len(data.get('competitors', []))
+        parts = len(data.get('partners', []))
+        print(f"   🤖 LLM Extracted: {prods} Products, {comps} Competitors, {parts} Partners.")
+        print(f"      -> Prods: {data.get('products')[:3]}...")
+        if prods > 0: print(f"      Example Prod: {data.get('products')[0]}")
+
+        return data
     except Exception as e:
-        print(f"⚠️ Ошибка Ollama для {name}: {e}")
-        # Возвращаем пустую структуру в случае ошибки
-        return CompanyDetails().model_dump()
+        print(f"⚠️ LLM Error: {e}")
+        return {}
 
+def clear_database():
+    """Чистит базу и создает индексы"""
+    print("Очистка базы данных...")
+    with driver.session() as session:
+        session.run("MATCH (n) DETACH DELETE n")
+
+        try:
+            session.run("DROP INDEX company_ticker IF EXISTS")
+            session.run("DROP CONSTRAINT company_ticker IF EXISTS")
+            session.run("DROP CONSTRAINT company_ticker_unique IF EXISTS")
+        except Exception as e:
+            print(f"⚠️ Warning cleaning schema: {e}")
+
+        session.run("CREATE CONSTRAINT company_ticker IF NOT EXISTS FOR (c:Company) REQUIRE c.ticker IS UNIQUE")
+
+        session.run("CREATE INDEX person_name IF NOT EXISTS FOR (p:Person) ON (p.name)")
+        session.run("CREATE INDEX fund_name IF NOT EXISTS FOR (f:Fund) ON (f.name)")
+        session.run("CREATE INDEX product_name IF NOT EXISTS FOR (p:Product) ON (p.name)")
+    print("База чиста, индексы созданы.")
 
 def build_graph(session, row, llm_data):
     ticker = row['Ticker']
@@ -142,22 +222,25 @@ def build_graph(session, row, llm_data):
     sector = row.get('Sector')
     industry = row.get('Industry')
 
-    if sector and sector != 'N/A':
+    if industry and industry != 'N/A' and sector and sector != 'N/A':
         session.run("""
-            MATCH (c:Company {ticker: $ticker})
-            MERGE (s:Sector {name: $sector})
-            MERGE (c)-[:OPERATES_IN_SECTOR]->(s)
-        """, ticker=ticker, sector=sector)
+                MATCH (c:Company {ticker: $ticker})
+                MERGE (i:Industry {name: $industry})
+                MERGE (s:Sector {name: $sector})
 
-    if industry and industry != 'N/A':
+                // 1. Компания входит в Индустрию (Подсектор)
+                MERGE (c)-[:OPERATES_IN_INDUSTRY]->(i)
+
+                // 2. Индустрия входит в Сектор
+                MERGE (i)-[:PART_OF]->(s)
+            """, ticker=ticker, industry=industry, sector=sector)
+
+    elif sector and sector != 'N/A':
         session.run("""
-            MATCH (c:Company {ticker: $ticker})
-            MERGE (i:Industry {name: $industry})
-            MERGE (c)-[:OPERATES_IN_INDUSTRY]->(i)
-            WITH i
-            MATCH (s:Sector {name: $sector})
-            MERGE (i)-[:PART_OF]->(s)
-        """, ticker=ticker, industry=industry, sector=sector)
+                MATCH (c:Company {ticker: $ticker})
+                MERGE (s:Sector {name: $sector})
+                MERGE (c)-[:OPERATES_IN_SECTOR]->(s)
+            """, ticker=ticker, sector=sector)
 
     # ЛЮДИ
     try:
@@ -167,7 +250,7 @@ def build_graph(session, row, llm_data):
                 session.run("""
                     MATCH (c:Company {ticker: $ticker})
                     MERGE (p:Person {name: $p_name})
-                    SET p.age = $age
+                    SET p.age = $age, p.title = $title
                     MERGE (p)-[:WORKS_FOR {title: $title}]->(c)
                 """, ticker=ticker, p_name=p['name'], title=p.get('title', ''), age=p.get('age'))
     except:
@@ -198,11 +281,50 @@ def build_graph(session, row, llm_data):
                     MERGE (c)-[:{rel_type}]->(n)
                 """, ticker=ticker, name=item)
 
-    merge_relation(llm_data.get('products', []), 'Product', 'PRODUCES')
-    merge_relation(llm_data.get('markets', []), 'Market', 'SERVES_MARKET')
-    merge_relation(llm_data.get('subsidiaries', []), 'Organization', 'OWNS_SUBSIDIARY')
-    merge_relation(llm_data.get('partners', []), 'Organization', 'PARTNER_WITH')
-    merge_relation(llm_data.get('competitors', []), 'Organization', 'COMPETES_WITH')
+    # Продукты
+    for prod in llm_data.get('products', []):
+        session.run("""
+            MATCH (c:Company {ticker: $ticker})
+            MERGE (p:Product {name: $prod})
+            MERGE (c)-[:PRODUCES]->(p)
+        """, ticker=ticker, prod=prod)
+
+    # Рынки
+    for mkt in llm_data.get('markets', []):
+        session.run("""
+            MATCH (c:Company {ticker: $ticker})
+            MERGE (m:Market {name: $mkt})
+            MERGE (c)-[:SERVES_MARKET]->(m)
+        """, ticker=ticker, mkt=mkt)
+
+    # Дочки
+    for sub in llm_data.get('subsidiaries', []):
+        session.run("""
+            MATCH (c:Company {ticker: $ticker})
+            MERGE (s:Organization {name: $sub})
+            MERGE (c)-[:OWNS_SUBSIDIARY]->(s)
+        """, ticker=ticker, sub=sub)
+
+    # Партнеры
+    for part in llm_data.get('partners', []):
+        target = find_sp500_ticker(part)
+        if target and target != ticker:
+            session.run(
+                "MATCH (c1:Company {ticker: $t1}) MERGE (c2:Company {ticker: $t2}) MERGE (c1)-[:PARTNER_WITH]->(c2)",
+                t1=ticker, t2=target)
+            print(f"      🔗 Link: Partner -> {part} ({target})")
+        else:
+            print(f"      ✂️ Skip: Partner {part} (Not in S&P500)")
+
+
+    # Конкуренты
+    for comp in llm_data.get('competitors', []):
+        target = find_sp500_ticker(comp)
+        if target and target != ticker:
+            session.run(
+                "MATCH (c1:Company {ticker: $t1}) MERGE (c2:Company {ticker: $t2}) MERGE (c1)-[:COMPETES_WITH]->(c2)",
+                t1=ticker, t2=target)
+            print(f"      ⚔️ Link: Competitor -> {comp} ({target})")
 
 
 def main():
@@ -212,35 +334,30 @@ def main():
         print(f"Файл {file_path} не найден.")
         return
 
-    print("Загружаем Excel...")
-    df = pd.read_excel(file_path)
-    
+    load_sp500_whitelist(df)
 
-    with driver.session() as session:
-        # Создание индексов (Constraints быстрее и надежнее индексов для уникальности)
-        session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (c:Company) REQUIRE c.ticker IS UNIQUE")
-        session.run("CREATE INDEX IF NOT EXISTS FOR (p:Person) ON (p.name)")
-        session.run("CREATE INDEX IF NOT EXISTS FOR (f:Fund) ON (f.name)")
-        
-        total = len(df)
-        print(f"Начинаем построение графа для {total} компаний, используя модель {OLLAMA_MODEL}.")
+    clear_database()
 
-        for i, row in df.iterrows():
-            ticker = row['Ticker']
-            print(f"[{i + 1}/{total}] {ticker}...", end=" ", flush=True)
+    df = df.head(20)
 
-            # 1. Запрос к Ollama
-            llm_data = ask_llm_for_details(row)
+    total = len(df)
+    print(f"Начинаем обработку {total} компаний.")
 
-            # 2. Запись в Neo4j
-            try:
+    for i, row in df.iterrows():
+        ticker = row['Ticker']
+        print(f"[{i + 1}/{total}] {ticker}...", end=" ")
+
+        llm_data = ask_llm_for_details(row)
+
+        try:
+            with driver.session() as session:
                 build_graph(session, row, llm_data)
-                print("✅ Готово")
-            except Exception as e:
-                print(f"❌ Ошибка Neo4j: {e}")
+            print("✅ Готово")
+        except Exception as e:
+            print(f"❌ Ошибка записи в Neo4j: {e}")
 
     driver.close()
-    print("Граф построен успешно!")
+    print("Граф успешно построен!")
 
 if __name__ == '__main__':
     main()
