@@ -1,20 +1,35 @@
 import pandas as pd
 import json
 import os
-from openai import OpenAI
+import ollama
+from typing import List, Optional
+from pydantic import BaseModel, Field
 from neo4j import GraphDatabase
 from dotenv import load_dotenv
 
+# Загрузка переменных окружения
 load_dotenv()
 
-POLZA_KEY = os.getenv("POLZA_API_KEY")
-NEO4J_URI = os.getenv("NEO4J_URI")
-NEO4J_USER = os.getenv("NEO4J_USERNAME")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
+# Настройки Neo4j
+NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+NEO4J_USER = os.getenv("NEO4J_USERNAME", "neo4j")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
 
-client = OpenAI(api_key=POLZA_KEY, base_url="https://api.polza.ai/api/v1")
+# Настройки Ollama
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma3:4b")
+OLLAMA_URL = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+
+# Инициализация драйвера Neo4j
 driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 
+# --- Pydantic модели для Structured Output ---
+# Это определяет схему, которой ОБЯЗАНА следовать модель
+class CompanyDetails(BaseModel):
+    products: List[str] = Field(default_factory=list, description="Ключевые продукты, бренды или технологии")
+    markets: List[str] = Field(default_factory=list, description="Рынки или сферы деятельности")
+    subsidiaries: List[str] = Field(default_factory=list, description="Дочерние компании или приобретенные бренды")
+    partners: List[str] = Field(default_factory=list, description="Упомянутые партнеры")
+    competitors: List[str] = Field(default_factory=list, description="Упомянутые конкуренты")
 
 def clean_money(value):
     """
@@ -24,20 +39,16 @@ def clean_money(value):
     try:
         if pd.isna(value) or value == 'N/A' or value == '':
             return None
-
         cleaned_val = float(value)
-
         if pd.isna(cleaned_val):
             return None
-
         return cleaned_val
     except:
         return None
 
-
-def ask_llm_for_details(row):
+def ask_llm_for_details(row) -> dict:
     """
-    Просим LLM структурировать неструктурированный текст описания.
+    Использует Ollama для извлечения структурированных данных.
     """
     name = row['Name']
     desc = str(row['Description'])[:1500]
@@ -45,40 +56,36 @@ def ask_llm_for_details(row):
     prompt = f"""
     Проанализируй описание компании "{name}".
     Текст: {desc}
-
-    Извлеки информацию и верни JSON объект со следующими полями (списками строк):
-    1. "products": Ключевые продукты, бренды или технологии (например: "iPhone", "Azure", "mRNA").
-    2. "markets": Рынки или сферы деятельности (например: "Cloud Computing", "E-commerce").
-    3. "subsidiaries": Дочерние компании или приобретенные бренды (например: "YouTube", "Instagram").
-    4. "partners": Упомянутые партнеры.
-    5. "competitors": Упомянутые конкуренты.
-
-    Отвечай ТОЛЬКО валидным JSON. Если какой-то список пуст, оставь [].
-    Пример:
-    {{
-        "products": ["Windows", "Office"],
-        "markets": ["Software", "Gaming"],
-        "subsidiaries": ["GitHub"],
-        "partners": ["OpenAI"],
-        "competitors": ["Apple"]
-    }}
+    
+    Извлеки информацию о продуктах, рынках, дочерних компаниях, партнерах и конкурентах.
+    Будь точен. Если информации нет, оставляй список пустым.
     """
 
     try:
-        completion = client.chat.completions.create(
-            model='qwen/qwen-2.5-7b-instruct',
+        # Использование client.chat с параметром format (schema)
+        # Это заставляет модель генерировать JSON строго по схеме Pydantic
+        response = ollama.chat(
+            model=OLLAMA_MODEL,
             messages=[
-                {'role': 'system', 'content': 'You are a strict data extraction assistant. Output JSON only.'},
+                {'role': 'system', 'content': 'Ты аналитик данных. Извлекай сущности строго по схеме JSON.'},
                 {'role': 'user', 'content': prompt},
             ],
-            temperature=0.0
+            format=CompanyDetails.model_json_schema(),
+            options={'temperature': 0.0}
         )
-        content = completion.choices[0].message.content
-        content = content.replace("```json", "").replace("```", "").strip()
-        return json.loads(content)
+
+        json_str = response['message']['content']
+        
+        # Валидация через Pydantic (превращает JSON строку в объект Python)
+        details = CompanyDetails.model_validate_json(json_str)
+        
+        # Возвращаем как словарь для совместимости с остальным кодом
+        return details.model_dump()
+
     except Exception as e:
-        print(f"⚠️ Ошибка LLM для {name}: {e}")
-        return {}
+        print(f"⚠️ Ошибка Ollama для {name}: {e}")
+        # Возвращаем пустую структуру в случае ошибки
+        return CompanyDetails().model_dump()
 
 
 def build_graph(session, row, llm_data):
@@ -112,28 +119,24 @@ def build_graph(session, row, llm_data):
             query_geo = """
             MATCH (c:Company {ticker: $ticker})
 
-            // 1. Создаем Город и Страну (они есть почти всегда)
             MERGE (city:City {name: $city})
             MERGE (cntry:Country {name: $country})
-
-            // 2. Связываем Компанию с Городом
             MERGE (c)-[:LOCATED_IN]->(city)
 
-            // 3. Логика со Штатом (он есть не у всех стран)
             FOREACH (ignoreMe IN CASE WHEN $state IS NOT NULL AND $state <> 'N/A' THEN [1] ELSE [] END |
                 MERGE (s:State {name: $state})
                 MERGE (city)-[:IN_STATE]->(s)
                 MERGE (s)-[:IN_COUNTRY]->(cntry)
             )
 
-            // 4. Если Штата нет, связываем Город напрямую со Страной
             FOREACH (ignoreMe IN CASE WHEN $state IS NULL OR $state = 'N/A' THEN [1] ELSE [] END |
                 MERGE (city)-[:IN_COUNTRY]->(cntry)
             )
             """
             session.run(query_geo, ticker=ticker, city=city, state=state, country=country)
     except Exception as e:
-        print(f"Geodata error: {e}")
+        # print(f"Geodata warning: {e}") 
+        pass
 
     # ИЕРАРХИЯ
     sector = row.get('Sector')
@@ -183,80 +186,61 @@ def build_graph(session, row, llm_data):
     except:
         pass
 
-    # LLM DATA
+    # LLM DATA (Интеграция данных от Ollama)
+    
+    # Вспомогательная функция для чистой вставки
+    def merge_relation(item_list, node_label, rel_type):
+        for item in item_list:
+            if item and isinstance(item, str):
+                session.run(f"""
+                    MATCH (c:Company {{ticker: $ticker}})
+                    MERGE (n:{node_label} {{name: $name}})
+                    MERGE (c)-[:{rel_type}]->(n)
+                """, ticker=ticker, name=item)
 
-    # Продукты
-    for prod in llm_data.get('products', []):
-        session.run("""
-            MATCH (c:Company {ticker: $ticker})
-            MERGE (p:Product {name: $prod})
-            MERGE (c)-[:PRODUCES]->(p)
-        """, ticker=ticker, prod=prod)
-
-    # Рынки
-    for mkt in llm_data.get('markets', []):
-        session.run("""
-            MATCH (c:Company {ticker: $ticker})
-            MERGE (m:Market {name: $mkt})
-            MERGE (c)-[:SERVES_MARKET]->(m)
-        """, ticker=ticker, mkt=mkt)
-
-    # Дочки
-    for sub in llm_data.get('subsidiaries', []):
-        session.run("""
-            MATCH (c:Company {ticker: $ticker})
-            MERGE (s:Organization {name: $sub})
-            MERGE (c)-[:OWNS_SUBSIDIARY]->(s)
-        """, ticker=ticker, sub=sub)
-
-    # Партнеры
-    for partner in llm_data.get('partners', []):
-        session.run("""
-            MATCH (c:Company {ticker: $ticker})
-            MERGE (o:Organization {name: $partner})
-            MERGE (c)-[:PARTNER_WITH]->(o)
-        """, ticker=ticker, partner=partner)
-
-    # Конкуренты
-    for comp in llm_data.get('competitors', []):
-        session.run("""
-            MATCH (c:Company {ticker: $ticker})
-            MERGE (o:Organization {name: $comp})
-            MERGE (c)-[:COMPETES_WITH]->(o)
-        """, ticker=ticker, comp=comp)
+    merge_relation(llm_data.get('products', []), 'Product', 'PRODUCES')
+    merge_relation(llm_data.get('markets', []), 'Market', 'SERVES_MARKET')
+    merge_relation(llm_data.get('subsidiaries', []), 'Organization', 'OWNS_SUBSIDIARY')
+    merge_relation(llm_data.get('partners', []), 'Organization', 'PARTNER_WITH')
+    merge_relation(llm_data.get('competitors', []), 'Organization', 'COMPETES_WITH')
 
 
 def main():
-    print("Загружаем Excel...")
-    df = pd.read_excel('data/sp500_graph_ready.xlsx')
+    # Проверка наличия файла
+    file_path = './data/sp500_graph_ready.xlsx'
+    if not os.path.exists(file_path):
+        print(f"Файл {file_path} не найден.")
+        return
 
-    df = df.head(20)
+    print("Загружаем Excel...")
+    df = pd.read_excel(file_path)
+    
 
     with driver.session() as session:
-        session.run("CREATE INDEX company_ticker IF NOT EXISTS FOR (c:Company) ON (c.ticker)")
-        session.run("CREATE INDEX person_name IF NOT EXISTS FOR (p:Person) ON (p.name)")
-        session.run("CREATE INDEX fund_name IF NOT EXISTS FOR (f:Fund) ON (f.name)")
-        session.run("CREATE INDEX city_name IF NOT EXISTS FOR (c:City) ON (c.name)")
-
-
+        # Создание индексов (Constraints быстрее и надежнее индексов для уникальности)
+        session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (c:Company) REQUIRE c.ticker IS UNIQUE")
+        session.run("CREATE INDEX IF NOT EXISTS FOR (p:Person) ON (p.name)")
+        session.run("CREATE INDEX IF NOT EXISTS FOR (f:Fund) ON (f.name)")
+        
         total = len(df)
-        print(f"Начинаем построение графа для {total} компаний.")
+        print(f"Начинаем построение графа для {total} компаний, используя модель {OLLAMA_MODEL}.")
 
         for i, row in df.iterrows():
             ticker = row['Ticker']
-            print(f"[{i + 1}/{total}] {ticker}...", end=" ")
+            print(f"[{i + 1}/{total}] {ticker}...", end=" ", flush=True)
 
+            # 1. Запрос к Ollama
             llm_data = ask_llm_for_details(row)
 
+            # 2. Запись в Neo4j
             try:
                 build_graph(session, row, llm_data)
                 print("✅ Готово")
             except Exception as e:
-                print(f"❌ Ошибка записи в Neo4j: {e}")
+                print(f"❌ Ошибка Neo4j: {e}")
 
     driver.close()
     print("Граф построен успешно!")
-
 
 if __name__ == '__main__':
     main()
