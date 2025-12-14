@@ -4,6 +4,8 @@ import os
 from openai import OpenAI
 from neo4j import GraphDatabase
 from dotenv import load_dotenv
+import wikipedia
+from rapidfuzz import process, fuzz
 
 load_dotenv()
 
@@ -13,8 +15,65 @@ NEO4J_USER = os.getenv("NEO4J_USERNAME")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
 
 client = OpenAI(api_key=POLZA_KEY, base_url="https://api.polza.ai/api/v1")
-driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+driver = GraphDatabase.driver(
+    NEO4J_URI,
+    auth=(NEO4J_USER, NEO4J_PASSWORD),
+    max_connection_lifetime=200,
+    keep_alive=True
+)
 
+SP500_MAPPING = {}
+
+def load_sp500_whitelist(df):
+    """Загружает список компаний"""
+    global SP500_MAPPING
+    SP500_MAPPING = pd.Series(df.Ticker.values, index=df.Name).to_dict()
+    print(f"список S&P 500 загружен: {len(SP500_MAPPING)} компаний.")
+
+def find_sp500_ticker(company_name):
+    """Ищет компанию в списке S&P 500"""
+    if not company_name or not isinstance(company_name, str): return None
+
+    if company_name in SP500_MAPPING: return SP500_MAPPING[company_name]
+
+    try:
+        match = process.extractOne(company_name, SP500_MAPPING.keys(), scorer=fuzz.token_sort_ratio)
+        if match:
+            best_name, score, _ = match
+            if score > 85: return SP500_MAPPING[best_name]
+    except:
+        pass
+    return None
+
+
+def get_wiki_intel(company_name):
+    """
+    Ищет страницу компании в Википедии и берет оттуда текст.
+    """
+    try:
+        search_results = wikipedia.search(f"{company_name} company")
+
+        if not search_results:
+            return ""
+
+        page_title = search_results[0]
+
+        page = wikipedia.page(page_title, auto_suggest=False)
+
+        print(f"Готово: {page.content[:2000]}")
+
+        return f"Wikipedia Title: {page.title}\nContent: {page.content[:2000]}"
+
+    except wikipedia.exceptions.DisambiguationError as e:
+        try:
+            page = wikipedia.page(e.options[0], auto_suggest=False)
+            print(f"Готово: {page.content[:2000]}")
+            return f"Wikipedia Title: {page.title}\nContent: {page.content[:2000]}"
+        except:
+            return ""
+    except Exception as e:
+        print(f"   ⚠️ Wiki Error: {e}")
+        return ""
 
 def clean_money(value):
     """
@@ -40,51 +99,75 @@ def ask_llm_for_details(row):
     Просим LLM структурировать неструктурированный текст описания.
     """
     name = row['Name']
-    desc = str(row['Description'])[:1500]
+    desc = str(row['Description'])[:800]
 
+    wiki_data = get_wiki_intel(name)
+    if wiki_data:
+        print(f"   📖 Wiki found: {wiki_data.splitlines()[0]}")
+    else:
+        print(f"   ⚠️ Wiki not found, using only Yahoo desc.")
     prompt = f"""
-    Проанализируй описание компании "{name}".
-    Текст: {desc}
+    Context about company "{name}":
+    1. Official Description: {desc}
+    2. Web Search Results: {wiki_data}
 
-    Извлеки информацию и верни JSON объект со следующими полями (списками строк):
-    1. "products": Ключевые продукты, бренды или технологии (например: "iPhone", "Azure", "mRNA").
-    2. "markets": Рынки или сферы деятельности (например: "Cloud Computing", "E-commerce").
-    3. "subsidiaries": Дочерние компании или приобретенные бренды (например: "YouTube", "Instagram").
-    4. "partners": Упомянутые партнеры.
-    5. "competitors": Упомянутые конкуренты.
-
-    Отвечай ТОЛЬКО валидным JSON. Если какой-то список пуст, оставь [].
-    Пример:
-    {{
-        "products": ["Windows", "Office"],
-        "markets": ["Software", "Gaming"],
-        "subsidiaries": ["GitHub"],
-        "partners": ["OpenAI"],
-        "competitors": ["Apple"]
-    }}
+    Task: Extract structured lists of entities based on the context.
+    
+    CRITICAL RULES:
+    1. OUTPUT MUST BE IN ENGLISH ONLY. Translate if the source is not English.
+    2. "products": Extract specific product names (e.g. "Windows", "Tylenol") or key service categories.
+    3. "competitors": Extract specific company names.
+    4. "partners": Extract specific company names mentioned as partners or suppliers.
+    
+    Return ONLY JSON. No markdown. No comments.
+    Format: {{ "products": [...], "competitors": [...], "partners": [...] }}
     """
 
     try:
         completion = client.chat.completions.create(
             model='qwen/qwen-2.5-7b-instruct',
-            messages=[
-                {'role': 'system', 'content': 'You are a strict data extraction assistant. Output JSON only.'},
-                {'role': 'user', 'content': prompt},
-            ],
+            messages=[{'role': 'user', 'content': prompt}],
             temperature=0.0
         )
         content = completion.choices[0].message.content
+
         content = content.replace("```json", "").replace("```", "").strip()
-        return json.loads(content)
+        if "{" in content:
+            content = content[content.find("{"):content.rfind("}") + 1]
+
+        data = json.loads(content)
+
+        prods = len(data.get('products', []))
+        comps = len(data.get('competitors', []))
+        parts = len(data.get('partners', []))
+        print(f"   🤖 LLM Extracted: {prods} Products, {comps} Competitors, {parts} Partners.")
+        print(f"      -> Prods: {data.get('products')[:3]}...")
+        if prods > 0: print(f"      Example Prod: {data.get('products')[0]}")
+
+        return data
     except Exception as e:
-        print(f"⚠️ Ошибка LLM для {name}: {e}")
+        print(f"⚠️ LLM Error: {e}")
         return {}
 
-def clear_database(session):
-    """Полная очистка базы перед новой загрузкой"""
-    print("Очищаем базу данных...")
-    session.run("MATCH (n) DETACH DELETE n")
-    print("База пуста и готова к работе.")
+def clear_database():
+    """Чистит базу и создает индексы"""
+    print("Очистка базы данных...")
+    with driver.session() as session:
+        session.run("MATCH (n) DETACH DELETE n")
+
+        try:
+            session.run("DROP INDEX company_ticker IF EXISTS")
+            session.run("DROP CONSTRAINT company_ticker IF EXISTS")
+            session.run("DROP CONSTRAINT company_ticker_unique IF EXISTS")
+        except Exception as e:
+            print(f"⚠️ Warning cleaning schema: {e}")
+
+        session.run("CREATE CONSTRAINT company_ticker IF NOT EXISTS FOR (c:Company) REQUIRE c.ticker IS UNIQUE")
+
+        session.run("CREATE INDEX person_name IF NOT EXISTS FOR (p:Person) ON (p.name)")
+        session.run("CREATE INDEX fund_name IF NOT EXISTS FOR (f:Fund) ON (f.name)")
+        session.run("CREATE INDEX product_name IF NOT EXISTS FOR (p:Product) ON (p.name)")
+    print("База чиста, индексы созданы.")
 
 def build_graph(session, row, llm_data):
     ticker = row['Ticker']
@@ -172,7 +255,7 @@ def build_graph(session, row, llm_data):
                 session.run("""
                     MATCH (c:Company {ticker: $ticker})
                     MERGE (p:Person {name: $p_name})
-                    SET p.age = $age
+                    SET p.age = $age, p.title = $title
                     MERGE (p)-[:WORKS_FOR {title: $title}]->(c)
                 """, ticker=ticker, p_name=p['name'], title=p.get('title', ''), age=p.get('age'))
     except:
@@ -218,54 +301,55 @@ def build_graph(session, row, llm_data):
         """, ticker=ticker, sub=sub)
 
     # Партнеры
-    for partner in llm_data.get('partners', []):
-        session.run("""
-            MATCH (c:Company {ticker: $ticker})
-            MERGE (o:Organization {name: $partner})
-            MERGE (c)-[:PARTNER_WITH]->(o)
-        """, ticker=ticker, partner=partner)
+    for part in llm_data.get('partners', []):
+        target = find_sp500_ticker(part)
+        if target and target != ticker:
+            session.run(
+                "MATCH (c1:Company {ticker: $t1}) MERGE (c2:Company {ticker: $t2}) MERGE (c1)-[:PARTNER_WITH]->(c2)",
+                t1=ticker, t2=target)
+            print(f"      🔗 Link: Partner -> {part} ({target})")
+        else:
+            print(f"      ✂️ Skip: Partner {part} (Not in S&P500)")
+
 
     # Конкуренты
     for comp in llm_data.get('competitors', []):
-        session.run("""
-            MATCH (c:Company {ticker: $ticker})
-            MERGE (o:Organization {name: $comp})
-            MERGE (c)-[:COMPETES_WITH]->(o)
-        """, ticker=ticker, comp=comp)
+        target = find_sp500_ticker(comp)
+        if target and target != ticker:
+            session.run(
+                "MATCH (c1:Company {ticker: $t1}) MERGE (c2:Company {ticker: $t2}) MERGE (c1)-[:COMPETES_WITH]->(c2)",
+                t1=ticker, t2=target)
+            print(f"      ⚔️ Link: Competitor -> {comp} ({target})")
 
 
 def main():
     print("Загружаем Excel...")
     df = pd.read_excel('data/sp500_graph_ready.xlsx')
 
+    load_sp500_whitelist(df)
+
+    clear_database()
+
     df = df.head(20)
 
-    with driver.session() as session:
-        clear_database(session)
+    total = len(df)
+    print(f"Начинаем обработку {total} компаний.")
 
-        session.run("CREATE INDEX company_ticker IF NOT EXISTS FOR (c:Company) ON (c.ticker)")
-        session.run("CREATE INDEX person_name IF NOT EXISTS FOR (p:Person) ON (p.name)")
-        session.run("CREATE INDEX fund_name IF NOT EXISTS FOR (f:Fund) ON (f.name)")
-        session.run("CREATE INDEX city_name IF NOT EXISTS FOR (c:City) ON (c.name)")
+    for i, row in df.iterrows():
+        ticker = row['Ticker']
+        print(f"[{i + 1}/{total}] {ticker}...", end=" ")
 
+        llm_data = ask_llm_for_details(row)
 
-        total = len(df)
-        print(f"Начинаем построение графа для {total} компаний.")
-
-        for i, row in df.iterrows():
-            ticker = row['Ticker']
-            print(f"[{i + 1}/{total}] {ticker}...", end=" ")
-
-            llm_data = ask_llm_for_details(row)
-
-            try:
+        try:
+            with driver.session() as session:
                 build_graph(session, row, llm_data)
-                print("✅ Готово")
-            except Exception as e:
-                print(f"❌ Ошибка записи в Neo4j: {e}")
+            print("✅ Готово")
+        except Exception as e:
+            print(f"❌ Ошибка записи в Neo4j: {e}")
 
     driver.close()
-    print("Граф построен успешно!")
+    print("Граф успешно построен!")
 
 
 if __name__ == '__main__':

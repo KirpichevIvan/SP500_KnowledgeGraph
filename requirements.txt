@@ -6,3 +6,6 @@ lxml
 openai
 neo4j
 python-dotenv
+certifi
+rapidfuzz
+wikipedia
