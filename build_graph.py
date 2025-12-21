@@ -1,21 +1,20 @@
 import pandas as pd
 import json
 import os
-import ollama
-from typing import List, Optional
-from pydantic import BaseModel, Field
+from openai import OpenAI
+import requests
+import datetime
 from neo4j import GraphDatabase
 from dotenv import load_dotenv
 import wikipedia
 from rapidfuzz import process, fuzz
 
-# Загрузка переменных окружения
 load_dotenv()
 
-# Настройки Neo4j
-NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-NEO4J_USER = os.getenv("NEO4J_USERNAME", "neo4j")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
+POLZA_KEY = os.getenv("POLZA_API_KEY")
+NEO4J_URI = os.getenv("NEO4J_URI")
+NEO4J_USER = os.getenv("NEO4J_USERNAME")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
 
 client = OpenAI(api_key=POLZA_KEY, base_url="https://api.polza.ai/api/v1")
 driver = GraphDatabase.driver(
@@ -33,20 +32,69 @@ def load_sp500_whitelist(df):
     SP500_MAPPING = pd.Series(df.Ticker.values, index=df.Name).to_dict()
     print(f"список S&P 500 загружен: {len(SP500_MAPPING)} компаний.")
 
-def find_sp500_ticker(company_name):
-    """Ищет компанию в списке S&P 500"""
-    if not company_name or not isinstance(company_name, str): return None
+def get_llm_match_decision(entity_name, candidates):
+    """
+    Спрашивает у LLM, подходит ли какой-то кандидат под имя.
+    """
+    candidates_str = "\n".join([f"- {name} (Ticker: {ticker})" for name, ticker in candidates])
 
-    if company_name in SP500_MAPPING: return SP500_MAPPING[company_name]
+    prompt = f"""
+    Task: Match the entity name found in text to the official S&P 500 company list.
+
+    [ENTITY FOUND IN TEXT]: "{entity_name}"
+
+    [OFFICIAL CANDIDATES]:
+    {candidates_str}
+
+    Instructions:
+    1. If the entity is definitely one of the candidates (even if names slightly differ, e.g. "Google" -> "Alphabet"), return its Ticker.
+    2. If NONE match, return null.
+
+    Return JSON ONLY: {{ "match_ticker": "XYZ" }} or {{ "match_ticker": null }}
+    """
 
     try:
-        match = process.extractOne(company_name, SP500_MAPPING.keys(), scorer=fuzz.token_sort_ratio)
-        if match:
-            best_name, score, _ = match
-            if score > 85: return SP500_MAPPING[best_name]
-    except:
-        pass
-    return None
+        completion = client.chat.completions.create(
+            model='qwen/qwen-2.5-7b-instruct',
+            messages=[{'role': 'user', 'content': prompt}],
+            temperature=0.0
+        )
+        content = completion.choices[0].message.content
+        content = content.replace("```json", "").replace("```", "").strip()
+        data = json.loads(content)
+        return data.get("match_ticker")
+    except Exception as e:
+        print(f"      ⚠️ LLM Match Error: {e}")
+        return None
+
+def find_sp500_ticker(company_name):
+    """
+    Умный поиск через LLM.
+    """
+    if not company_name or not isinstance(company_name, str): return None
+
+    if company_name in SP500_MAPPING:
+        return SP500_MAPPING[company_name]
+
+    matches = process.extract(company_name, SP500_MAPPING.keys(), limit=5, scorer=fuzz.WRatio)
+
+    candidates = []
+    for match_name, score, _ in matches:
+        if score > 50:
+            candidates.append((match_name, SP500_MAPPING[match_name]))
+
+    if not candidates:
+        return None
+
+    print(f"      🔎 LLM Checking: '{company_name}' vs {len(candidates)} options...", end="")
+    best_ticker = get_llm_match_decision(company_name, candidates)
+
+    if best_ticker:
+        print(f" ✅ Match: {best_ticker}")
+        return best_ticker
+    else:
+        print(f" ❌ No match")
+        return None
 
 
 def get_wiki_intel(company_name):
@@ -54,18 +102,35 @@ def get_wiki_intel(company_name):
     Ищет страницу компании в Википедии и берет оттуда текст.
     """
     try:
-        search_results = wikipedia.search(f"{company_name} company")
+        results = wikipedia.search(f"{company_name} company")
 
-        if not search_results:
+        if not results:
             return ""
 
-        page_title = search_results[0]
+        page = wikipedia.page(results[0], auto_suggest=False)
 
-        page = wikipedia.page(page_title, auto_suggest=False)
+        content = f"SUMMARY:\n{page.summary[:800]}\n\n"
 
-        print(f"Готово: {page.content[:2000]}")
+        keywords = ['product', 'service', 'operation', 'division', 'segment', 'business']
 
-        return f"Wikipedia Title: {page.title}\nContent: {page.content[:2000]}"
+        found_sections = 0
+        for section in page.sections:
+            if any(k in section.lower() for k in keywords):
+                try:
+                    sec_content = page.section(section)
+                    if sec_content:
+                        content += f"SECTION '{section.upper()}':\n{sec_content[:1500]}\n\n"
+                        found_sections += 1
+                except:
+                    pass
+
+            if found_sections >= 2:
+                break
+
+        if found_sections == 0:
+            content += f"CONTENT:\n{page.content[:1500]}"
+
+        return content[:3500]
 
     except wikipedia.exceptions.DisambiguationError as e:
         try:
@@ -78,6 +143,45 @@ def get_wiki_intel(company_name):
         print(f"   ⚠️ Wiki Error: {e}")
         return ""
 
+
+def get_gdelt_partnerships(company_name):
+    """
+    Ищет в GDELT новости о партнерствах за последний год.
+    """
+    print(f"   📡 GDELT: Ищем сделки для {company_name}...")
+
+    url = "https://api.gdeltproject.org/api/v2/doc/doc"
+
+    query = f'"{company_name}" (partnership OR collaboration OR "joint venture" OR acquisition) sourcelang:eng'
+
+    params = {
+        'query': query,
+        'mode': 'artlist',  # Список статей
+        'maxrecords': '5',  # Максимум статей
+        'format': 'json',  # Формат ответа
+        'timespan': '18m'  # За последний период
+    }
+
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    }
+
+    text_result = ""
+    try:
+        response = requests.get(url, params=params, headers=headers, timeout=5)
+        try:
+            data = response.json()
+        except json.JSONDecodeError:
+            return ""
+
+        if 'articles' in data:
+            for art in data['articles']:
+                text_result += f"- News: {art.get('title', '')}\n"
+    except Exception as e:
+        print(f"   ⚠️ GDELT Error: {e}")
+
+    return text_result
+
 def clean_money(value):
     """
     Возвращает число, если оно есть.
@@ -86,40 +190,62 @@ def clean_money(value):
     try:
         if pd.isna(value) or value == 'N/A' or value == '':
             return None
+
         cleaned_val = float(value)
+
         if pd.isna(cleaned_val):
             return None
+
         return cleaned_val
     except:
         return None
 
-def ask_llm_for_details(row) -> dict:
+
+def ask_llm_for_details(row):
     """
-    Использует Ollama для извлечения структурированных данных.
+    Просим LLM структурировать неструктурированный текст описания.
     """
     name = row['Name']
     desc = str(row['Description'])[:800]
 
     wiki_data = get_wiki_intel(name)
     if wiki_data:
-        print(f"   📖 Wiki found: {wiki_data.splitlines()[0]}")
+        print(f"   📖 Wiki found: {wiki_data}")
     else:
         print(f"   ⚠️ Wiki not found, using only Yahoo desc.")
-    prompt = f"""
-    Context about company "{name}":
-    1. Official Description: {desc}
-    2. Web Search Results: {wiki_data}
 
-    Task: Extract structured lists of entities based on the context.
+    news_data = get_gdelt_partnerships(name)
+    if news_data:
+        print(f"   📖 News found: {news_data}")
+    else:
+        print(f"   ⚠️ News not found.")
+
+    prompt = f"""
+    Analyze data about "{name}".
+
+    [DESCRIPTION]: {desc}
+    [WIKIPEDIA]: {wiki_data}
+    [NEWS (Partnerships)]: {news_data}
+
+
+    Task: Extract structured lists with EVIDENCE.
     
-    CRITICAL RULES:
-    1. OUTPUT MUST BE IN ENGLISH ONLY. Translate if the source is not English.
-    2. "products": Extract specific product names (e.g. "Windows", "Tylenol") or key service categories.
-    3. "competitors": Extract specific company names.
-    4. "partners": Extract specific company names mentioned as partners or suppliers.
+    1. "products": List of key product names or service lines.
+    2. "partners": List of strategic partners/suppliers found in the text.
+       - "name": Company name.
+       - "evidence": Short reason/quote (e.g. "Joint venture for AI chips").
+    3. "competitors": Major competitors mentioned.
+
+    Rules:
+    - OUTPUT ENGLISH ONLY.
+    - If no evidence found for partner, use "Strategic relationship".
     
-    Return ONLY JSON. No markdown. No comments.
-    Format: {{ "products": [...], "competitors": [...], "partners": [...] }}
+    Return JSON Example:
+    {{
+        "products": ["iPhone", "Mac"],
+        "partners": [ {{"name": "OpenAI", "evidence": "Integration deal"}}, {{"name": "TSMC", "evidence": "Chip supplier"}} ],
+        "competitors": ["Samsung"]
+    }}
     """
 
     try:
@@ -139,6 +265,7 @@ def ask_llm_for_details(row) -> dict:
         prods = len(data.get('products', []))
         comps = len(data.get('competitors', []))
         parts = len(data.get('partners', []))
+        print(f'products {data.get('products', [])}, competitors {data.get('competitors', [])}, partners {data.get('partners', [])}')
         print(f"   🤖 LLM Extracted: {prods} Products, {comps} Competitors, {parts} Partners.")
         print(f"      -> Prods: {data.get('products')[:3]}...")
         if prods > 0: print(f"      Example Prod: {data.get('products')[0]}")
@@ -155,7 +282,6 @@ def clear_database():
         session.run("MATCH (n) DETACH DELETE n")
 
         try:
-            session.run("DROP INDEX company_ticker IF EXISTS")
             session.run("DROP CONSTRAINT company_ticker IF EXISTS")
             session.run("DROP CONSTRAINT company_ticker_unique IF EXISTS")
         except Exception as e:
@@ -166,10 +292,13 @@ def clear_database():
         session.run("CREATE INDEX person_name IF NOT EXISTS FOR (p:Person) ON (p.name)")
         session.run("CREATE INDEX fund_name IF NOT EXISTS FOR (f:Fund) ON (f.name)")
         session.run("CREATE INDEX product_name IF NOT EXISTS FOR (p:Product) ON (p.name)")
+        session.run("CREATE INDEX org_name IF NOT EXISTS FOR (o:Organization) ON (o.name)")
+        session.run("CREATE INDEX industry_name IF NOT EXISTS FOR (i:Industry) ON (i.name)")
     print("База чиста, индексы созданы.")
 
 def build_graph(session, row, llm_data):
     ticker = row['Ticker']
+    today = datetime.date.today().isoformat()
 
     # УЗЕЛ КОМПАНИИ
     query_company = """
@@ -178,7 +307,8 @@ def build_graph(session, row, llm_data):
         c.description = $desc,
         c.website = $website,
         c.market_cap = $mcap,
-        c.employees = $emp
+        c.employees = $emp,
+        c.last_updated = $date
     """
     session.run(query_company,
                 ticker=ticker,
@@ -186,7 +316,8 @@ def build_graph(session, row, llm_data):
                 desc=str(row['Description'])[:500],
                 website=row.get('Website', 'N/A'),
                 mcap=clean_money(row.get('Market Cap')),
-                emp=clean_money(row.get('Employees')))
+                emp=clean_money(row.get('Employees')),
+                date=today)
 
     # ГЕОГРАФИЯ (Город -> Штат -> Страна)
     try:
@@ -215,8 +346,7 @@ def build_graph(session, row, llm_data):
             """
             session.run(query_geo, ticker=ticker, city=city, state=state, country=country)
     except Exception as e:
-        # print(f"Geodata warning: {e}") 
-        pass
+        print(f"Geodata error: {e}")
 
     # ИЕРАРХИЯ
     sector = row.get('Sector')
@@ -269,17 +399,7 @@ def build_graph(session, row, llm_data):
     except:
         pass
 
-    # LLM DATA (Интеграция данных от Ollama)
-    
-    # Вспомогательная функция для чистой вставки
-    def merge_relation(item_list, node_label, rel_type):
-        for item in item_list:
-            if item and isinstance(item, str):
-                session.run(f"""
-                    MATCH (c:Company {{ticker: $ticker}})
-                    MERGE (n:{node_label} {{name: $name}})
-                    MERGE (c)-[:{rel_type}]->(n)
-                """, ticker=ticker, name=item)
+    # LLM DATA
 
     # Продукты
     for prod in llm_data.get('products', []):
@@ -307,32 +427,50 @@ def build_graph(session, row, llm_data):
 
     # Партнеры
     for part in llm_data.get('partners', []):
-        target = find_sp500_ticker(part)
-        if target and target != ticker:
-            session.run(
-                "MATCH (c1:Company {ticker: $t1}) MERGE (c2:Company {ticker: $t2}) MERGE (c1)-[:PARTNER_WITH]->(c2)",
-                t1=ticker, t2=target)
-            print(f"      🔗 Link: Partner -> {part} ({target})")
-        else:
-            print(f"      ✂️ Skip: Partner {part} (Not in S&P500)")
+        p_name = part.get('name')
+        evidence = part.get('evidence', 'No evidence provided')
+
+        sp500_ticker = find_sp500_ticker(p_name)
+
+        if sp500_ticker and sp500_ticker != ticker:
+            session.run("""
+                    MATCH (c1:Company {ticker: $t1})
+                    MERGE (c2:Company {ticker: $t2})
+                    MERGE (c1)-[r:PARTNER_WITH]->(c2)
+                    SET r.source = 'News GDELT / Wiki / Description', r.evidence = $ev
+                """, t1=ticker, t2=sp500_ticker, ev=evidence)
+            print(f"      🔗 Link (Company): {ticker} <-> {sp500_ticker} (Ev: {evidence[:30]}...)")
 
 
     # Конкуренты
     for comp in llm_data.get('competitors', []):
         target = find_sp500_ticker(comp)
         if target and target != ticker:
-            session.run(
-                "MATCH (c1:Company {ticker: $t1}) MERGE (c2:Company {ticker: $t2}) MERGE (c1)-[:COMPETES_WITH]->(c2)",
-                t1=ticker, t2=target)
+            session.run("""
+                    MATCH (c1:Company {ticker: $t1}) 
+                    MERGE (c2:Company {ticker: $t2}) 
+                    MERGE (c1)-[r:COMPETES_WITH]->(c2)
+                    SET r.source = 'LLM Extraction (News GDELT / Wiki / Description)'
+            """, t1=ticker, t2=target)
             print(f"      ⚔️ Link: Competitor -> {comp} ({target})")
 
+def post_process_competitors():
+    """
+    Создание железных связей конкурентов по индустрии.
+    """
+    print("\n⚔️ Генерация конкурентов по Индустрии (GICS)...")
+    with driver.session() as session:
+        session.run("""
+            MATCH (c1:Company)-[:OPERATES_IN_INDUSTRY]->(i:Industry)<-[:OPERATES_IN_INDUSTRY]-(c2:Company)
+            WHERE c1.ticker < c2.ticker
+            MERGE (c1)-[r:COMPETES_WITH]->(c2)
+            ON CREATE SET r.source = 'GICS Industry'
+        """)
+    print("✅ Глобальная карта конкуренции создана.")
 
 def main():
-    # Проверка наличия файла
-    file_path = './data/sp500_graph_ready.xlsx'
-    if not os.path.exists(file_path):
-        print(f"Файл {file_path} не найден.")
-        return
+    print("Загружаем Excel...")
+    df = pd.read_excel('data/sp500_graph_ready.xlsx')
 
     load_sp500_whitelist(df)
 
@@ -356,8 +494,10 @@ def main():
         except Exception as e:
             print(f"❌ Ошибка записи в Neo4j: {e}")
 
+    post_process_competitors()
     driver.close()
     print("Граф успешно построен!")
+
 
 if __name__ == '__main__':
     main()
