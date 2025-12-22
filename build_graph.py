@@ -168,7 +168,7 @@ def get_gdelt_partnerships(company_name):
 
     text_result = ""
     try:
-        response = requests.get(url, params=params, headers=headers, timeout=5)
+        response = requests.get(url, params=params, headers=headers, timeout=30)
         try:
             data = response.json()
         except json.JSONDecodeError:
