@@ -107,16 +107,21 @@ def find_entity(name):
     if not name or not isinstance(name, str): return None
     clean_search = clean_name(name)
 
-    if clean_search in WHITELIST: return WHITELIST[clean_search]
+    if clean_search in WHITELIST:
+        return WHITELIST[clean_search]
 
-    match = process.extractOne(clean_search, WHITELIST.keys(), scorer=fuzz.WRatio)
-    if match and match[1] > 88: return WHITELIST[match[0]]
+    fuzzy_candidates = [k for k in WHITELIST.keys() if len(k) > 3]
+
+    match = process.extractOne(clean_search, fuzzy_candidates, scorer=fuzz.WRatio)
+
+    if match and match[1] > 90:
+        return WHITELIST[match[0]]
 
     if len(clean_search) > 2:
         official = resolve_alias_via_llm(clean_search)
         if official:
             if official in WHITELIST: return WHITELIST[official]
-            match_llm = process.extractOne(official, WHITELIST.keys(), scorer=fuzz.WRatio)
+            match_llm = process.extractOne(official, fuzzy_candidates, scorer=fuzz.WRatio)
             if match_llm and match_llm[1] > 90: return WHITELIST[match_llm[0]]
 
     return None
