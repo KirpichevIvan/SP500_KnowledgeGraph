@@ -5,11 +5,11 @@ from openai import OpenAI
 import requests
 import datetime
 from neo4j import GraphDatabase
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 import wikipedia
 from rapidfuzz import process, fuzz
 
-load_dotenv()
+load_dotenv(find_dotenv())
 
 POLZA_KEY = os.getenv("POLZA_API_KEY")
 NEO4J_URI = os.getenv("NEO4J_URI")
@@ -470,7 +470,7 @@ def post_process_competitors():
 
 def main():
     print("Загружаем Excel...")
-    df = pd.read_excel('data/sp500_graph_ready.xlsx')
+    df = pd.read_excel('../data/sp500_graph_ready.xlsx')
 
     load_sp500_whitelist(df)
 

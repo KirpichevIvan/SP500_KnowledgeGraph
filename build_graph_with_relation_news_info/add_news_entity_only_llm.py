@@ -5,11 +5,11 @@ import re
 from datetime import datetime
 from openai import OpenAI
 from neo4j import GraphDatabase
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 from rapidfuzz import process, fuzz
 import time
 
-load_dotenv()
+load_dotenv(find_dotenv())
 
 # --- КОНФИГУРАЦИЯ ---
 POLZA_KEY = os.getenv("POLZA_API_KEY")
@@ -35,7 +35,7 @@ def load_comprehensive_whitelist():
     print("📋 Loading Whitelist...")
     try:
         # Убедитесь, что файл существует
-        df = pd.read_excel('data/sp500_graph_ready.xlsx')
+        df = pd.read_excel('../data/sp500_graph_ready.xlsx')
         for _, row in df.iterrows():
             c_name = str(row['Name'])
             ticker = str(row['Ticker'])
@@ -261,7 +261,7 @@ def main():
     load_comprehensive_whitelist()
 
     try:
-        df = pd.read_csv('data/classified_reuters_news_mapped.csv')
+        df = pd.read_csv('../data/classified_reuters_news_mapped.csv')
     except:
         print("❌ CSV missing")
         return
@@ -275,8 +275,8 @@ def main():
             print(f"[{i + 1}/{total}]", end=" ")
 
             item = {
-                "headline": str(row['Headlines']),
-                "description": str(row['Description']),
+                "headline": str(row['headline']),
+                "description": str(row['text']),
                 "date": str(row['Time'])
             }
 
