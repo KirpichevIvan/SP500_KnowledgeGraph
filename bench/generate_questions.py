@@ -4,16 +4,16 @@ import random
 import re
 
 # Настройки
-INPUT_FILE = '../data/sp500_graph_ready.csv'  # Имя вашего файла
+INPUT_FILE = '../data/sp500_graph_ready.csv'  # путь к файлу
 OUTPUT_FILE = 'benchmark_qa.csv'
 NUM_QUESTIONS = 100
 
 def load_data(filepath):
     """Загрузка данных и первичная обработка."""
     try:
-        df = pd.read_csv(filepath, sep=';') # Обратите внимание на разделитель, в вашем примере это точка с запятой
+        df = pd.read_csv(filepath, sep=';')
     except:
-        df = pd.read_csv(filepath, sep=',') # Если вдруг запятая
+        df = pd.read_csv(filepath, sep=',')
     return df
 
 def safe_json_parse(json_str):

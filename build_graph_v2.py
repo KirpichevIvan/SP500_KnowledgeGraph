@@ -214,7 +214,7 @@ def main():
 
     print("Загружаем Excel...")
     df = pd.read_excel(file_path)
-    
+    df = df.head(100)
 
     with driver.session() as session:
         # Создание индексов (Constraints быстрее и надежнее индексов для уникальности)
