@@ -11,7 +11,6 @@ import time
 
 load_dotenv(find_dotenv())
 
-# --- КОНФИГУРАЦИЯ ---
 POLZA_KEY = os.getenv("POLZA_API_KEY")
 NEO4J_URI = os.getenv("NEO4J_URI")
 NEO4J_USER = os.getenv("NEO4J_USERNAME")
@@ -23,7 +22,6 @@ driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 WHITELIST = {}
 
 
-# --- ЗАГРУЗКА БАЗЫ (Компании, Люди, Фонды) ---
 def clean_name(text):
     if not isinstance(text, str): return ""
     text = re.sub(r'\b(Mr\.|Mrs\.|Ms\.|Dr\.|Inc\.|Corp\.|plc|Ltd\.)\b', '', text, flags=re.IGNORECASE)
@@ -34,7 +32,6 @@ def load_comprehensive_whitelist():
     global WHITELIST
     print("📋 Loading Whitelist...")
     try:
-        # Убедитесь, что файл существует
         df = pd.read_excel('../data/sp500_graph_ready.xlsx')
         for _, row in df.iterrows():
             c_name = str(row['Name'])
@@ -83,7 +80,6 @@ def parse_date(date_str):
         return datetime.today().strftime("%Y-%m-%d")
 
 
-# --- ПОИСК СУЩНОСТИ ---
 def resolve_alias_via_llm(name):
     prompt = f"""
     Identify the official entity name for "{name}".
@@ -127,7 +123,6 @@ def find_entity(name):
     return None
 
 
-# --- АНАЛИЗ ОДНОЙ НОВОСТИ (ИСПРАВЛЕНО) ---
 def analyze_single_news(news_item):
     text = f"Headline: {news_item['headline']}\nDescription: {news_item['description']}"
 
@@ -164,11 +159,9 @@ def analyze_single_news(news_item):
         )
         content = completion.choices[0].message.content.replace("```json", "").replace("```", "").strip()
 
-        # --- ФИКС ЗДЕСЬ: Проверка на список ---
         parsed_data = json.loads(content)
 
         if isinstance(parsed_data, list):
-            # Если LLM вернула список, берем первый элемент
             if len(parsed_data) > 0:
                 return parsed_data[0]
             else:
@@ -181,11 +174,9 @@ def analyze_single_news(news_item):
         return None
 
 
-# --- ЗАПИСЬ В БАЗУ ---
 def save_to_graph(session, analysis, news_item):
     if not analysis: return 0
 
-    # Теперь .get() точно сработает, так как analysis это dict
     entities_raw = analysis.get('entities', [])
     interaction = analysis.get('interaction')
     sentiment = analysis.get('sentiment', 'NEUTRAL')
@@ -211,7 +202,7 @@ def save_to_graph(session, analysis, news_item):
 
     log_entry = f"[{iso_date}] {sentiment}: {headline} -> {summary}"
 
-    # СЦЕНАРИЙ А: Взаимодействие
+    #  Взаимодействие
     if interaction and isinstance(interaction, dict) and len(valid_entities) >= 2:
         src_match = find_entity(interaction.get('source'))
         trg_match = find_entity(interaction.get('target'))
@@ -242,7 +233,7 @@ def save_to_graph(session, analysis, news_item):
             session.run(query, id1=ent1['id'], id2=ent2['id'], date=iso_date, log=log_entry)
             return 1
 
-    # СЦЕНАРИЙ Б: Новость-узел
+    #  Новость-узел
     ent = valid_entities[0]
     print(f"   📰 News: {ent['id']} ({ent['type']})")
 

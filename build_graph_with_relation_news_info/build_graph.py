@@ -227,24 +227,28 @@ def ask_llm_for_details(row):
     [WIKIPEDIA]: {wiki_data}
     [NEWS (Partnerships)]: {news_data}
 
-
     Task: Extract structured lists with EVIDENCE.
-    
-    1. "products": List of key product names or service lines.
-    2. "partners": List of strategic partners/suppliers found in the text.
-       - "name": Company name.
-       - "evidence": Short reason/quote (e.g. "Joint venture for AI chips").
-    3. "competitors": Major competitors mentioned.
 
-    Rules:
-    - OUTPUT ENGLISH ONLY.
-    - If no evidence found for partner, use "Strategic relationship".
-    
+    1. "products": List of key product names or service lines.
+    2. "partners": List of strategic partners/suppliers.
+       - "name": Company name.
+       - "evidence": Short reason (e.g. "Joint venture for AI chips").
+    3. "competitors": List of major competitors.
+       - "name": Company name.
+       - "evidence": Short reason (e.g. "Rival in streaming market").
+
+    CRITICAL RULES:
+    1. IGNORE Market Summaries: If a news headline lists multiple companies just for earnings...
+       -> EXCEPTION: If the headline describes a specific INTERACTION...
+    2. IGNORE Subsidiaries...
+    3. CLEAN NAMES: In the "name" field, output ONLY the proper company name (e.g. "Samsung"). DO NOT write sentences like "Mentioned as key competitor" in the name field.
+    4. OUTPUT ENGLISH ONLY.
+
     Return JSON Example:
     {{
         "products": ["iPhone", "Mac"],
-        "partners": [ {{"name": "OpenAI", "evidence": "Integration deal"}}, {{"name": "TSMC", "evidence": "Chip supplier"}} ],
-        "competitors": ["Samsung"]
+        "partners": [ {{"name": "OpenAI", "evidence": "Integration deal"}} ],
+        "competitors": [ {{"name": "Samsung", "evidence": "Competes in smartphones"}}, {{"name": "Netflix", "evidence": "Streaming rival"}} ]
     }}
     """
 
@@ -437,36 +441,35 @@ def build_graph(session, row, llm_data):
                     MATCH (c1:Company {ticker: $t1})
                     MERGE (c2:Company {ticker: $t2})
                     MERGE (c1)-[r:PARTNER_WITH]->(c2)
-                    SET r.source = 'News GDELT / Wiki / Description', r.evidence = $ev
+                    SET r.source = 'LLM Extraction (News GDELT / Wiki / Description)', r.evidence = $ev,
+                            r.last_updated = date()
                 """, t1=ticker, t2=sp500_ticker, ev=evidence)
             print(f"      🔗 Link (Company): {ticker} <-> {sp500_ticker} (Ev: {evidence[:30]}...)")
 
 
     # Конкуренты
     for comp in llm_data.get('competitors', []):
-        target = find_sp500_ticker(comp)
+        if isinstance(comp, str):
+            comp_name = comp
+            comp_evidence = "Mentioned as competitor in text"
+        else:
+            comp_name = comp.get('name')
+            comp_evidence = comp.get('evidence', 'Mentioned as competitor')
+
+        target = find_sp500_ticker(comp_name)
+
         if target and target != ticker:
             session.run("""
-                    MATCH (c1:Company {ticker: $t1}) 
-                    MERGE (c2:Company {ticker: $t2}) 
-                    MERGE (c1)-[r:COMPETES_WITH]->(c2)
-                    SET r.source = 'LLM Extraction (News GDELT / Wiki / Description)'
-            """, t1=ticker, t2=target)
-            print(f"      ⚔️ Link: Competitor -> {comp} ({target})")
+                        MATCH (c1:Company {ticker: $t1}) 
+                        MERGE (c2:Company {ticker: $t2}) 
+                        MERGE (c1)-[r:COMPETES_WITH]->(c2)
+                        SET r.source = 'LLM Extraction (News GDELT / Wiki / Description)',
+                            r.evidence = $ev,
+                            r.last_updated = date()
+                """, t1=ticker, t2=target, ev=comp_evidence)
 
-def post_process_competitors():
-    """
-    Создание железных связей конкурентов по индустрии.
-    """
-    print("\n⚔️ Генерация конкурентов по Индустрии (GICS)...")
-    with driver.session() as session:
-        session.run("""
-            MATCH (c1:Company)-[:OPERATES_IN_INDUSTRY]->(i:Industry)<-[:OPERATES_IN_INDUSTRY]-(c2:Company)
-            WHERE c1.ticker < c2.ticker
-            MERGE (c1)-[r:COMPETES_WITH]->(c2)
-            ON CREATE SET r.source = 'GICS Industry'
-        """)
-    print("✅ Глобальная карта конкуренции создана.")
+            ev_short = comp_evidence[:30] + "..." if len(comp_evidence) > 30 else comp_evidence
+            print(f"      ⚔️ Link: Competitor -> {comp_name} ({target}) [Ev: {ev_short}]")
 
 def main():
     print("Загружаем Excel...")
@@ -476,7 +479,7 @@ def main():
 
     clear_database()
 
-    df = df.head(20)
+    # df = df.head(20)
 
     total = len(df)
     print(f"Начинаем обработку {total} компаний.")
@@ -494,7 +497,6 @@ def main():
         except Exception as e:
             print(f"❌ Ошибка записи в Neo4j: {e}")
 
-    post_process_competitors()
     driver.close()
     print("Граф успешно построен!")
 
