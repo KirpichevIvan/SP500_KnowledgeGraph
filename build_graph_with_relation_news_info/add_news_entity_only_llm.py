@@ -30,7 +30,7 @@ def clean_name(text):
 
 def load_comprehensive_whitelist():
     global WHITELIST
-    print("📋 Loading Whitelist...")
+    print("Loading Whitelist...")
     try:
         df = pd.read_excel('../data/sp500_graph_ready.xlsx')
         for _, row in df.iterrows():
@@ -66,9 +66,9 @@ def load_comprehensive_whitelist():
             except:
                 pass
 
-        print(f"   ✅ Whitelist loaded: {len(WHITELIST)} entries.")
+        print(f"   Whitelist loaded: {len(WHITELIST)} entries.")
     except Exception as e:
-        print(f"   ❌ Error loading Excel: {e}")
+        print(f"   Error loading Excel: {e}")
         exit()
 
 
@@ -235,7 +235,7 @@ def save_to_graph(session, analysis, news_item):
 
     #  Новость-узел
     ent = valid_entities[0]
-    print(f"   📰 News: {ent['id']} ({ent['type']})")
+    print(f"   News: {ent['id']} ({ent['type']})")
 
     query = f"""
     MATCH (e:{ent['type']} {{ {ent['key_field']}: $id }})
@@ -254,7 +254,7 @@ def main():
     try:
         df = pd.read_csv('../data/classified_reuters_news_mapped.csv')
     except:
-        print("❌ CSV missing")
+        print("CSV missing")
         return
 
     total = len(df)
@@ -280,7 +280,7 @@ def main():
                 print("LLM failed.")
 
     driver.close()
-    print(f"\n✅ DONE! Processed {processed_count} news events.")
+    print(f"\nDONE! Processed {processed_count} news events.")
 
 
 if __name__ == "__main__":

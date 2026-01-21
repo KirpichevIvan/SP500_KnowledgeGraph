@@ -24,13 +24,13 @@ class NewsGraphPipeline:
 
         model_path = r"C:\sp500_models\all-MiniLM-L6-v2"
 
-        print(f"⏳ Загрузка модели из {model_path}...")
+        print(f"Загрузка модели из {model_path}...")
         try:
             self.embedder = SentenceTransformer(model_path)
             self.vector_dim = 384
-            print("✅ Модель загружена успешно (CPU).")
+            print("Модель загружена успешно (CPU).")
         except Exception as e:
-            print(f"❌ Ошибка загрузки модели: {e}")
+            print(f"Ошибка загрузки модели: {e}")
             print("Проверь, что файлы лежат в C:\\sp500_models\\all-MiniLM-L6-v2")
             exit()
 
@@ -43,7 +43,7 @@ class NewsGraphPipeline:
         return self.embedder.encode(text).tolist()
 
     def setup_knowledge_base_vectors(self):
-        print("\n🏗️ === ПОДГОТОВКА ВЕКТОРНОЙ БАЗЫ (SETUP) ===")
+        print("\n=== ПОДГОТОВКА ВЕКТОРНОЙ БАЗЫ (SETUP) ===")
         target_labels = ["Company", "Person", "Fund", "City", "Country"]
 
         # Удаление старых данных
@@ -100,9 +100,9 @@ class NewsGraphPipeline:
                 """)
                 time.sleep(5)
             except Exception as e:
-                print(f"⚠️ Index info: {e}")
+                print(f"Index info: {e}")
 
-        print("✅ База готова.")
+        print("База готова.")
 
     def resolve_entity(self, name_query, threshold=0.70):
         if not name_query or len(name_query) < 2: return None
@@ -171,9 +171,9 @@ class NewsGraphPipeline:
             return None
 
     def process_csv(self, file_path):
-        print(f"\n🚀 Запуск обработки новостей: {file_path}")
+        print(f"\nЗапуск обработки новостей: {file_path}")
         if not os.path.exists(file_path):
-            print("❌ Файл не найден"); return
+            print("Файл не найден"); return
 
         df = pd.read_csv(file_path)
         stats = {"edges": 0, "news_nodes": 0, "skipped": 0}
@@ -201,10 +201,10 @@ class NewsGraphPipeline:
                         uid = f"{match['type']}_{match['id']}"
                         if uid not in seen_uids:
                             found_entities.append(match); seen_uids.add(uid)
-                            tqdm.write(f"   ✅ '{name}' -> {match['name']} ({match['type']})")
+                            tqdm.write(f"   '{name}' -> {match['name']} ({match['type']})")
 
                 if not found_entities:
-                    # tqdm.write("   ⚠️ No match.")
+                    # tqdm.write("   No match.")
                     stats['skipped'] += 1; continue
 
                 try: iso_date = datetime.strptime(str(date_str).strip(), "%b %d %Y").strftime("%Y-%m-%d")
@@ -227,7 +227,7 @@ class NewsGraphPipeline:
                         elif "INVEST" in rel_raw: rel = "INVESTED_IN"
                         elif trg['type'] in ['City', 'Country']: rel = "AFFECTS_REGION"
 
-                        tqdm.write(f"   🔗 LINK: {src['name']} -[{rel}]-> {trg['name']}")
+                        tqdm.write(f"   LINK: {src['name']} -[{rel}]-> {trg['name']}")
 
                         session.run(f"""
                             MATCH (a:{src['type']} {{ {src['key_field']}: $id1 }}), (b:{trg['type']} {{ {trg['key_field']}: $id2 }})

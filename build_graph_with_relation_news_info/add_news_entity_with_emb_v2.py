@@ -23,13 +23,13 @@ class FinancialGraphPipeline:
         self.client = OpenAI(api_key=self.polza_key, base_url="https://api.polza.ai/api/v1")
 
         model_path = r"C:\sp500_models\all-MiniLM-L6-v2"
-        print(f"⏳ Загрузка модели из {model_path}...")
+        print(f"Загрузка модели из {model_path}...")
         try:
             self.embedder = SentenceTransformer(model_path)
             self.vector_dim = 384
-            print("✅ Модель загружена успешно.")
+            print("Модель загружена успешно.")
         except Exception as e:
-            print(f"❌ Ошибка загрузки модели: {e}")
+            print(f"Ошибка загрузки модели: {e}")
             exit()
 
     def close(self):
@@ -41,7 +41,7 @@ class FinancialGraphPipeline:
         return self.embedder.encode(clean_text).tolist()
 
     def setup_knowledge_base(self):
-        print("\n🏗️  Генерация насыщенных векторов (Rich Embeddings)...")
+        print("\nГенерация насыщенных векторов (Rich Embeddings)...")
         target_labels = ["Company", "Person", "Fund", "City", "Country", "Sector", "Subsector"]
 
         with self.driver.session() as session:
@@ -86,14 +86,14 @@ class FinancialGraphPipeline:
                     `vector.similarity_function`: 'cosine'
                 }}}}
             """)
-            print("✅ База знаний готова.")
+            print("База знаний готова.")
 
     def resolve_entity(self, name_query, threshold=0.84):
         if not name_query or len(str(name_query)) < 2: return None
         name_query = str(name_query).strip()
 
         with self.driver.session() as session:
-            # 1. Точный поиск (Исправлено: добавлено AS node)
+            # Точный поиск
             exact_q = """
             MATCH (n:Searchable)
             WHERE toLower(n.ticker) = toLower($q) OR toLower(n.name) = toLower($q)
@@ -103,7 +103,7 @@ class FinancialGraphPipeline:
             if res:
                 return self._format_resolve_data(res, 1.0)
 
-            # 2. Векторный поиск
+            # Векторный поиск
             vec = self._get_vector(name_query)
             vec_q = """
             CALL db.index.vector.queryNodes('unified_entity_index', 1, $vec)
@@ -128,7 +128,7 @@ class FinancialGraphPipeline:
         }
 
     def process_csv(self, file_path):
-        print(f"\n🚀 Запуск обработки новостей: {file_path}")
+        print(f"\nЗапуск обработки новостей: {file_path}")
         if not os.path.exists(file_path): return
 
         df = pd.read_csv(file_path)
@@ -159,10 +159,10 @@ class FinancialGraphPipeline:
                             seen_uids.add(uid)
                             # ВЫВОД: ЧТО НАШЛИ
                             tqdm.write(
-                                f"   ✅ '{name}' -> {match['name']} ({match['type']}) [score: {match['score']:.2f}]")
+                                f"   '{name}' -> {match['name']} ({match['type']}) [score: {match['score']:.2f}]")
 
                 if not found_entities:
-                    # tqdm.write(f"   ⚠️ Скип: '{headline[:50]}...' (нет совпадений)")
+                    # tqdm.write(f"   Скип: '{headline[:50]}...' (нет совпадений)")
                     stats['skipped'] += 1;
                     continue
 
@@ -176,13 +176,13 @@ class FinancialGraphPipeline:
                 sentiment = analysis.get('sentiment', 'NEUTRAL')
                 interaction = analysis.get('interaction')
 
-                # 1. Создаем узел Новости
+                # Создаем узел Новости
                 session.run("""
                     MERGE (n:News {headline: $h, date: date($d)})
                     SET n.sentiment = $s
                 """, h=headline, d=iso_date, s=sentiment)
 
-                # 2. Связываем (MENTIONS)
+                # Связываем
                 for ent in found_entities:
                     session.run(f"""
                         MATCH (n:News {{headline: $h, date: date($d)}}), (e:{ent['type']} {{ {ent['key_field']}: $eid }})
@@ -190,7 +190,7 @@ class FinancialGraphPipeline:
                         SET r.match_score = $score
                     """, h=headline, d=iso_date, eid=ent['id'], score=ent['score'])
 
-                # 3. Взаимодействие (Interaction)
+                # 3. Взаимодействие
                 if interaction and len(found_entities) >= 2:
                     src = self.resolve_entity(interaction.get('source')) or found_entities[0]
                     trg = self.resolve_entity(interaction.get('target')) or found_entities[1]
@@ -199,7 +199,7 @@ class FinancialGraphPipeline:
                         rel = str(interaction.get('relation', 'RELATED_TO')).upper().replace(" ", "_")
 
                         # ВЫВОД: СВЯЗЬ
-                        tqdm.write(f"   🔗 LINK: {src['name']} -[{rel}]-> {trg['name']}")
+                        tqdm.write(f"   LINK: {src['name']} -[{rel}]-> {trg['name']}")
 
                         session.run(f"""
                             MATCH (a:{src['type']} {{ {src['key_field']}: $id1 }}), 
@@ -211,7 +211,7 @@ class FinancialGraphPipeline:
 
                 stats['added'] += 1
 
-        print(f"\n🏁 Итоги: {stats}")
+        print(f"\nИтоги: {stats}")
 
     def _analyze_news_llm(self, headline, description):
         prompt = f"""
