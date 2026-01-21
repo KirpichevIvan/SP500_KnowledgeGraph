@@ -234,8 +234,6 @@ class GraphEnricher:
                 // Если связь уже была (создал Скрипт 2 или прошлый запуск Скрипта 3)
                 ON MATCH SET 
                     r.updated_at = date(),
-                    // COALESCE: Если списка еще нет (связь от Скрипта 2), создай пустой и добавь.
-                    // Если список есть, просто добавь.
                     r.evidence_log = CASE 
                         WHEN r.evidence_log IS NULL THEN [$new_fact]
                         WHEN NOT $new_fact IN r.evidence_log THEN r.evidence_log + $new_fact
@@ -250,7 +248,7 @@ class GraphEnricher:
                     session.run(final_query, t1=ticker_a, t2=ticker_b, new_fact=fact_json)
 
                     ev_short = fact_object['specific_evidence']
-                    if len(ev_short) > 150: ev_short = ev_short[:150] + "..."
+                    if len(ev_short) > 100: ev_short = ev_short[:100] + "..."
 
                     print(f"         -> Saved: {rel_name} [{fact_object['topic']}] (Ev: {ev_short})")
                 except Exception as e:
@@ -258,13 +256,15 @@ class GraphEnricher:
 
     def clear_inference_data(self):
         """
-        Удаляет только связи, созданные этим скриптом (Inference),
-        не трогая базовый граф из Википедии/GDELT.
+        Удаляет только связи, созданные этим скриптом (Inference).
+        ВАЖНО: Нельзя удалять по наличию evidence_log, так как Скрипт 2 теперь тоже его пишет.
         """
         print("Очистка предыдущих результатов Inference...")
+
+        # Исправленный запрос: удаляем только если источник - наш AI Inference
         query = """
         MATCH ()-[r]->()
-        WHERE r.source CONTAINS 'Inference' OR r.evidence_log IS NOT NULL
+        WHERE r.source = 'AI Inference' OR r.source = 'AI Inference + Others'
         DELETE r
         """
         with driver.session() as session:
