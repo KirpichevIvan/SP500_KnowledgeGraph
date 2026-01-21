@@ -39,17 +39,9 @@ def get_llm_match_decision(entity_name, candidates):
     candidates_str = "\n".join([f"- {name} (Ticker: {ticker})" for name, ticker in candidates])
 
     prompt = f"""
-    Task: Match the entity name found in text to the official S&P 500 company list.
-
-    [ENTITY FOUND IN TEXT]: "{entity_name}"
-
-    [OFFICIAL CANDIDATES]:
+    Task: Match entity "{entity_name}" to S&P 500 list.
+    Candidates:
     {candidates_str}
-
-    Instructions:
-    1. If the entity is definitely one of the candidates (even if names slightly differ, e.g. "Google" -> "Alphabet"), return its Ticker.
-    2. If NONE match, return null.
-
     Return JSON ONLY: {{ "match_ticker": "XYZ" }} or {{ "match_ticker": null }}
     """
 
@@ -64,7 +56,7 @@ def get_llm_match_decision(entity_name, candidates):
         data = json.loads(content)
         return data.get("match_ticker")
     except Exception as e:
-        print(f"      ⚠️ LLM Match Error: {e}")
+        print(f"      LLM Match Error: {e}")
         return None
 
 def find_sp500_ticker(company_name):
@@ -86,14 +78,14 @@ def find_sp500_ticker(company_name):
     if not candidates:
         return None
 
-    print(f"      🔎 LLM Checking: '{company_name}' vs {len(candidates)} options...", end="")
+    print(f"      LLM Checking: '{company_name}' vs {len(candidates)} options...", end="")
     best_ticker = get_llm_match_decision(company_name, candidates)
 
     if best_ticker:
-        print(f" ✅ Match: {best_ticker}")
+        print(f" Match: {best_ticker}")
         return best_ticker
     else:
-        print(f" ❌ No match")
+        print(f" No match")
         return None
 
 
@@ -140,7 +132,7 @@ def get_wiki_intel(company_name):
         except:
             return ""
     except Exception as e:
-        print(f"   ⚠️ Wiki Error: {e}")
+        print(f"   Wiki Error: {e}")
         return ""
 
 
@@ -148,7 +140,7 @@ def get_gdelt_partnerships(company_name):
     """
     Ищет в GDELT новости о партнерствах за последний год.
     """
-    print(f"   📡 GDELT: Ищем сделки для {company_name}...")
+    print(f"   GDELT: Ищем сделки для {company_name}...")
 
     url = "https://api.gdeltproject.org/api/v2/doc/doc"
 
@@ -178,7 +170,7 @@ def get_gdelt_partnerships(company_name):
             for art in data['articles']:
                 text_result += f"- News: {art.get('title', '')}\n"
     except Exception as e:
-        print(f"   ⚠️ GDELT Error: {e}")
+        print(f"   GDELT Error: {e}")
 
     return text_result
 
@@ -210,45 +202,41 @@ def ask_llm_for_details(row):
 
     wiki_data = get_wiki_intel(name)
     if wiki_data:
-        print(f"   📖 Wiki found: {wiki_data}")
+        print(f"   Wiki found: {wiki_data}")
     else:
-        print(f"   ⚠️ Wiki not found, using only Yahoo desc.")
+        print(f"   Wiki not found, using only Yahoo desc.")
 
     news_data = get_gdelt_partnerships(name)
     if news_data:
-        print(f"   📖 News found: {news_data}")
+        print(f"   News found: {news_data}")
     else:
-        print(f"   ⚠️ News not found.")
+        print(f"   News not found.")
 
     prompt = f"""
     Analyze data about "{name}".
-
     [DESCRIPTION]: {desc}
     [WIKIPEDIA]: {wiki_data}
-    [NEWS (Partnerships)]: {news_data}
+    [NEWS]: {news_data}
 
     Task: Extract structured lists with EVIDENCE.
-
-    1. "products": List of key product names or service lines.
-    2. "partners": List of strategic partners/suppliers.
+    1. "products": List of key products.
+    2. "partners": List of strategic partners.
        - "name": Company name.
-       - "evidence": Short reason (e.g. "Joint venture for AI chips").
+       - "evidence": Short reason.
     3. "competitors": List of major competitors.
        - "name": Company name.
-       - "evidence": Short reason (e.g. "Rival in streaming market").
+       - "evidence": Short reason.
 
     CRITICAL RULES:
-    1. IGNORE Market Summaries: If a news headline lists multiple companies just for earnings...
-       -> EXCEPTION: If the headline describes a specific INTERACTION...
-    2. IGNORE Subsidiaries...
-    3. CLEAN NAMES: In the "name" field, output ONLY the proper company name (e.g. "Samsung"). DO NOT write sentences like "Mentioned as key competitor" in the name field.
-    4. OUTPUT ENGLISH ONLY.
-
+    1. IGNORE Market Summaries (lists of stocks).
+    2. IGNORE Subsidiaries.
+    3. Output JSON.
+    
     Return JSON Example:
     {{
         "products": ["iPhone", "Mac"],
         "partners": [ {{"name": "OpenAI", "evidence": "Integration deal"}} ],
-        "competitors": [ {{"name": "Samsung", "evidence": "Competes in smartphones"}}, {{"name": "Netflix", "evidence": "Streaming rival"}} ]
+        "competitors": [ {{"name": "Samsung", "evidence": "Competes in smartphones"}} ]
     }}
     """
 
@@ -270,13 +258,13 @@ def ask_llm_for_details(row):
         comps = len(data.get('competitors', []))
         parts = len(data.get('partners', []))
         print(f'products {data.get('products', [])}, competitors {data.get('competitors', [])}, partners {data.get('partners', [])}')
-        print(f"   🤖 LLM Extracted: {prods} Products, {comps} Competitors, {parts} Partners.")
+        print(f"   LLM Extracted: {prods} Products, {comps} Competitors, {parts} Partners.")
         print(f"      -> Prods: {data.get('products')[:3]}...")
         if prods > 0: print(f"      Example Prod: {data.get('products')[0]}")
 
         return data
     except Exception as e:
-        print(f"⚠️ LLM Error: {e}")
+        print(f"LLM Error: {e}")
         return {}
 
 def clear_database():
@@ -289,7 +277,7 @@ def clear_database():
             session.run("DROP CONSTRAINT company_ticker IF EXISTS")
             session.run("DROP CONSTRAINT company_ticker_unique IF EXISTS")
         except Exception as e:
-            print(f"⚠️ Warning cleaning schema: {e}")
+            print(f"Warning cleaning schema: {e}")
 
         session.run("CREATE CONSTRAINT company_ticker IF NOT EXISTS FOR (c:Company) REQUIRE c.ticker IS UNIQUE")
 
@@ -429,47 +417,98 @@ def build_graph(session, row, llm_data):
             MERGE (c)-[:OWNS_SUBSIDIARY]->(s)
         """, ticker=ticker, sub=sub)
 
-    # Партнеры
-    for part in llm_data.get('partners', []):
-        p_name = part.get('name')
-        evidence = part.get('evidence', 'No evidence provided')
+    def add_rel(items, rel_type, topic):
+        for item in items:
+            name = item.get('name') if isinstance(item, dict) else item
+            evidence = item.get('evidence', 'Mentioned') if isinstance(item, dict) else 'Mentioned'
+            target = find_sp500_ticker(name)
 
-        sp500_ticker = find_sp500_ticker(p_name)
+            if target and target != ticker:
+                fact = json.dumps({
+                    "source": "LLM Extraction (Wiki/GDELT)", "topic": topic,
+                    "specific_evidence": evidence, "date_recorded": today, "confidence": "High"
+                }, ensure_ascii=False)
 
-        if sp500_ticker and sp500_ticker != ticker:
-            session.run("""
-                    MATCH (c1:Company {ticker: $t1})
-                    MERGE (c2:Company {ticker: $t2})
-                    MERGE (c1)-[r:PARTNER_WITH]->(c2)
-                    SET r.source = 'LLM Extraction (News GDELT / Wiki / Description)', r.evidence = $ev,
-                            r.last_updated = date()
-                """, t1=ticker, t2=sp500_ticker, ev=evidence)
-            print(f"      🔗 Link (Company): {ticker} <-> {sp500_ticker} (Ev: {evidence[:30]}...)")
+                session.run(f"""
+                    MATCH (a:Company {{ticker: $t1}}), (b:Company {{ticker: $t2}})
+                    MERGE (a)-[r:{rel_type}]->(b)
+                    SET r.source = 'LLM Extraction (Wiki/GDELT)', r.evidence = $ev, r.last_updated = $dt
+                    FOREACH (_ IN CASE WHEN r.evidence_log IS NULL THEN [1] ELSE [] END | SET r.evidence_log = [$fact])
+                    FOREACH (_ IN CASE WHEN r.evidence_log IS NOT NULL AND NOT $fact IN r.evidence_log THEN [1] ELSE [] END | SET r.evidence_log = r.evidence_log + $fact)
+                """, t1=ticker, t2=target, ev=evidence, dt=today, fact=fact)
+                print(f"      {rel_type}: {ticker} <-> {target}")
 
+    add_rel(llm_data.get('partners', []), "PARTNER_WITH", "General Partnership")
+    add_rel(llm_data.get('competitors', []), "COMPETES_WITH", "General Competition")
 
-    # Конкуренты
-    for comp in llm_data.get('competitors', []):
-        if isinstance(comp, str):
-            comp_name = comp
-            comp_evidence = "Mentioned as competitor in text"
-        else:
-            comp_name = comp.get('name')
-            comp_evidence = comp.get('evidence', 'Mentioned as competitor')
-
-        target = find_sp500_ticker(comp_name)
-
-        if target and target != ticker:
-            session.run("""
-                        MATCH (c1:Company {ticker: $t1}) 
-                        MERGE (c2:Company {ticker: $t2}) 
-                        MERGE (c1)-[r:COMPETES_WITH]->(c2)
-                        SET r.source = 'LLM Extraction (News GDELT / Wiki / Description)',
-                            r.evidence = $ev,
-                            r.last_updated = date()
-                """, t1=ticker, t2=target, ev=comp_evidence)
-
-            ev_short = comp_evidence[:30] + "..." if len(comp_evidence) > 30 else comp_evidence
-            print(f"      ⚔️ Link: Competitor -> {comp_name} ({target}) [Ev: {ev_short}]")
+    # # Партнеры
+    # for part in llm_data.get('partners', []):
+    #     p_name = part.get('name') if isinstance(part, dict) else part
+    #     evidence = part.get('evidence', 'Mentioned in text') if isinstance(part, dict) else 'Mentioned'
+    #
+    #     target_ticker = find_sp500_ticker(p_name)
+    #
+    #     if target_ticker and target_ticker != ticker:
+    #         fact_json = json.dumps({
+    #             "source": "LLM Extraction (Wiki/GDELT)",
+    #             "topic": "General Partnership",
+    #             "specific_evidence": evidence,
+    #             "date_recorded": today,
+    #             "confidence": "High"
+    #         }, ensure_ascii=False)
+    #
+    #         session.run("""
+    #                 MATCH (c1:Company {ticker: $t1})
+    #                 MERGE (c2:Company {ticker: $t2})
+    #                 MERGE (c1)-[r:PARTNER_WITH]->(c2)
+    #
+    #                 SET r.source = 'LLM Extraction (Wiki/GDELT)',
+    #                     r.evidence = $ev,
+    #                     r.last_updated = date()
+    #
+    #                 FOREACH (_ IN CASE WHEN r.evidence_log IS NULL THEN [1] ELSE [] END |
+    #                     SET r.evidence_log = [$fact]
+    #                 )
+    #                 FOREACH (_ IN CASE WHEN r.evidence_log IS NOT NULL AND NOT $fact IN r.evidence_log THEN [1] ELSE [] END |
+    #                     SET r.evidence_log = r.evidence_log + $fact
+    #                 )
+    #             """, t1=ticker, t2=target_ticker, ev=evidence, fact=fact_json)
+    #         print(f"      🔗 Partner: {ticker} <-> {target_ticker}")
+    #
+    #
+    # # Конкуренты
+    # for comp in llm_data.get('competitors', []):
+    #     c_name = comp.get('name') if isinstance(comp, dict) else comp
+    #     evidence = comp.get('evidence', 'Mentioned as competitor') if isinstance(comp, dict) else 'Mentioned'
+    #
+    #     target_ticker = find_sp500_ticker(c_name)
+    #
+    #     if target_ticker and target_ticker != ticker:
+    #         fact_json = json.dumps({
+    #             "source": "LLM Extraction (Wiki/GDELT)",
+    #             "topic": "General Competition",
+    #             "specific_evidence": evidence,
+    #             "date_recorded": today,
+    #             "confidence": "High"
+    #         }, ensure_ascii=False)
+    #
+    #         session.run("""
+    #                 MATCH (c1:Company {ticker: $t1})
+    #                 MERGE (c2:Company {ticker: $t2})
+    #                 MERGE (c1)-[r:COMPETES_WITH]->(c2)
+    #
+    #                 SET r.source = 'LLM Extraction (Wiki/GDELT)',
+    #                     r.evidence = $ev,
+    #                     r.last_updated = date()
+    #
+    #                 FOREACH (_ IN CASE WHEN r.evidence_log IS NULL THEN [1] ELSE [] END |
+    #                     SET r.evidence_log = [$fact]
+    #                 )
+    #                 FOREACH (_ IN CASE WHEN r.evidence_log IS NOT NULL AND NOT $fact IN r.evidence_log THEN [1] ELSE [] END |
+    #                     SET r.evidence_log = r.evidence_log + $fact
+    #                 )
+    #             """, t1=ticker, t2=target_ticker, ev=evidence, fact=fact_json)
+    #         print(f"      ⚔️ Competitor: {ticker} <-> {target_ticker}")
 
 def main():
     print("Загружаем Excel...")
@@ -493,9 +532,9 @@ def main():
         try:
             with driver.session() as session:
                 build_graph(session, row, llm_data)
-            print("✅ Готово")
+            print("Готово")
         except Exception as e:
-            print(f"❌ Ошибка записи в Neo4j: {e}")
+            print(f"Ошибка записи в Neo4j: {e}")
 
     driver.close()
     print("Граф успешно построен!")
