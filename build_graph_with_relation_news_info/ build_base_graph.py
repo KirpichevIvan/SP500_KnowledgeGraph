@@ -13,7 +13,6 @@ from rapidfuzz import fuzz
 import functools
 
 
-# Декоратор для повторных попыток при сбоях сети
 def retry(max_retries=3, delay=2):
     def decorator(func):
         @functools.wraps(func)
@@ -23,9 +22,8 @@ def retry(max_retries=3, delay=2):
                     return func(*args, **kwargs)
                 except Exception as e:
                     if i == max_retries - 1:
-                        print(f"Ошибка в {func.__name__} после {max_retries} попыток: {e}")
+                        print(f"Ошибка в {func.__name__}: {e}")
                         return None
-                    print(f"Сбой в {func.__name__} ({e}). Повтор {i + 1}/{max_retries} через {delay} сек...")
                     time.sleep(delay)
 
         return wrapper
@@ -47,13 +45,12 @@ if not os.path.exists(MODEL_PATH):
 EXCEL_PATH = '../data/sp500_graph_ready.xlsx'
 NEWS_CSV_PATH = '../data/classified_reuters_news_mapped.csv'
 
-THRESHOLD_AUTO_ACCEPT = 0.84
 THRESHOLD_MIN_CHECK = 0.70
 
 
 class BaseGraphBuilder:
     def __init__(self):
-        print("Инициализация...")
+        print("Инициализация Base Graph Builder...")
         self.driver = GraphDatabase.driver(
             NEO4J_URI,
             auth=(NEO4J_USER, NEO4J_PASSWORD),
@@ -61,19 +58,13 @@ class BaseGraphBuilder:
             keep_alive=True,
             connection_timeout=10
         )
-
-        self.client = OpenAI(
-            api_key=POLZA_KEY,
-            base_url="https://api.polza.ai/api/v1",
-            timeout=30.0
-        )
+        self.client = OpenAI(api_key=POLZA_KEY, base_url="https://api.polza.ai/api/v1", timeout=30.0)
 
         print(f"Загрузка модели эмбеддингов...")
         try:
             self.embedder = SentenceTransformer(MODEL_PATH)
             self.vector_dim = 384
         except:
-            print("Ошибка загрузки локальной модели, качаем...")
             self.embedder = SentenceTransformer('all-MiniLM-L6-v2')
             self.vector_dim = 384
 
@@ -92,60 +83,39 @@ class BaseGraphBuilder:
                 session.run("DROP INDEX entity_vector_index IF EXISTS")
             except:
                 pass
+
             try:
                 session.run("CREATE CONSTRAINT company_ticker IF NOT EXISTS FOR (c:Company) REQUIRE c.ticker IS UNIQUE")
             except:
                 pass
-            try:
-                session.run("CREATE INDEX product_name IF NOT EXISTS FOR (p:Product) ON (p.name)")
-            except:
-                pass
+
+            for label in ["Person", "Product", "Resource", "News", "Fund", "City", "State", "Country"]:
+                try:
+                    session.run(f"CREATE INDEX {label.lower()}_name IF NOT EXISTS FOR (n:{label}) ON (n.name)")
+                except:
+                    pass
+
         print("База чиста.")
 
-
-    @retry(max_retries=2, delay=2)
+    @retry(max_retries=2, delay=1)
     def get_wiki_summary_safe(self, name):
-        """Безопасный запрос к Википедии"""
         results = wikipedia.search(f"{name} company")
         if not results: return ""
         page = wikipedia.page(results[0], auto_suggest=False)
         return page.summary[:1000]
 
-    @retry(max_retries=3, delay=5)
+    @retry(max_retries=3, delay=3)
     def extract_attributes_llm_safe(self, name, full_desc):
-        """Безопасный запрос к LLM (Атрибуты)"""
         prompt = f"""
         Analyze company: "{name}".
         Context: {full_desc[:1500]}
-
         Task: Extract two lists:
         1. "products": Specific products/services they SELL.
         2. "resources": Key raw materials/technologies/services they BUY (Inputs/Needs).
-
-        Return JSON: {{ "products": ["Item A", "Item B"], "resources": ["Material X", "Service Y"] }}
+        Return JSON: {{ "products": ["A", "B"], "resources": ["X", "Y"] }}
         """
         resp = self.client.chat.completions.create(
-            model='qwen/qwen-2.5-7b-instruct',
-            messages=[{'role': 'user', 'content': prompt}],
-            temperature=0.0
-        )
-        txt = resp.choices[0].message.content.replace("```json", "").replace("```", "").strip()
-        if "{" in txt: txt = txt[txt.find("{"):txt.rfind("}") + 1]
-        return json.loads(txt)
-
-    @retry(max_retries=3, delay=5)
-    def analyze_news_llm_safe(self, headline):
-        """Безопасный запрос к LLM (Новости)"""
-        prompt = f"""
-        Analyze news: "{headline}"
-        Task: Extract MAIN entities (Companies, Funds, Locations, Industries). Ignore people.
-        Determine Sentiment (-1.0 to 1.0).
-        Return JSON: {{ "entities": ["Name1", "Name2"], "sentiment": 0.5 }}
-        """
-        resp = self.client.chat.completions.create(
-            model='qwen/qwen-2.5-7b-instruct',
-            messages=[{'role': 'user', 'content': prompt}],
-            temperature=0.0
+            model='qwen/qwen-2.5-7b-instruct', messages=[{'role': 'user', 'content': prompt}], temperature=0.0
         )
         txt = resp.choices[0].message.content.replace("```json", "").replace("```", "").strip()
         if "{" in txt: txt = txt[txt.find("{"):txt.rfind("}") + 1]
@@ -153,50 +123,55 @@ class BaseGraphBuilder:
 
     def process_companies(self):
         print(f"\nЗагрузка ядра графа из {EXCEL_PATH}...")
-        if not os.path.exists(EXCEL_PATH):
-            print(f"Файл {EXCEL_PATH} не найден!")
-            return
+        if not os.path.exists(EXCEL_PATH): return
 
         df = pd.read_excel(EXCEL_PATH)
         today = datetime.date.today().isoformat()
 
-        pbar = tqdm(df.iterrows(), total=len(df), desc="Processing")
-
-        for i, row in pbar:
+        for i, row in tqdm(df.iterrows(), total=len(df), desc="Building Core"):
             ticker = row['Ticker']
             name = row['Name']
             yf_desc = str(row['Description'])
 
-            pbar.set_description(f"Proc: {ticker} (Wiki...)")
-
             wiki_text = self.get_wiki_summary_safe(name) or ""
-
-            full_description = f"Yahoo: {yf_desc}\nWikipedia: {wiki_text}"
+            full_desc = f"Yahoo: {yf_desc}\nWikipedia: {wiki_text}"
 
             with self.driver.session() as session:
                 session.run("""
                     MERGE (c:Company {ticker: $t})
-                    SET c.name = $n, 
-                        c.description = $d, 
-                        c.wiki_summary = $w,
-                        c.last_updated = $dt
+                    SET c.name = $n, c.description = $d, c.wiki_summary = $w, c.last_updated = $dt
                     MERGE (s:Sector {name: $sect})
                     MERGE (i:Industry {name: $ind})
                     MERGE (c)-[:OPERATES_IN_INDUSTRY]->(i)
                     MERGE (i)-[:PART_OF]->(s)
-                """, t=ticker, n=name, d=yf_desc, w=wiki_text, dt=today,
+                """, t=ticker, n=name, d=yf_desc[:600], w=wiki_text, dt=today,
                             sect=row.get('Sector', 'Unknown'), ind=row.get('Industry', 'Unknown'))
 
                 try:
                     addr = json.loads(row['Address_JSON'])
-                    if addr.get('city') and addr.get('city') != 'N/A':
+                    city = addr.get('city')
+                    state = addr.get('state')
+                    country = addr.get('country')
+
+                    if city and city != 'N/A':
                         session.run("""
                             MATCH (c:Company {ticker: $t})
                             MERGE (city:City {name: $city})
-                            MERGE (cntry:Country {name: $cntry})
+                            MERGE (cntry:Country {name: $country})
                             MERGE (c)-[:LOCATED_IN]->(city)
-                            MERGE (city)-[:IN_COUNTRY]->(cntry)
-                        """, t=ticker, city=addr.get('city'), cntry=addr.get('country'))
+
+                            // Если есть штат -> связываем через штат
+                            FOREACH (_ IN CASE WHEN $state IS NOT NULL AND $state <> 'N/A' THEN [1] ELSE [] END |
+                                MERGE (s:State {name: $state})
+                                MERGE (city)-[:IN_STATE]->(s)
+                                MERGE (s)-[:IN_COUNTRY]->(cntry)
+                            )
+
+                            // Если штата нет -> связываем напрямую
+                            FOREACH (_ IN CASE WHEN $state IS NULL OR $state = 'N/A' THEN [1] ELSE [] END |
+                                MERGE (city)-[:IN_COUNTRY]->(cntry)
+                            )
+                        """, t=ticker, city=city, state=state, country=country)
                 except:
                     pass
 
@@ -224,11 +199,8 @@ class BaseGraphBuilder:
                 except:
                     pass
 
-            pbar.set_description(f"Proc: {ticker} (LLM...)")
-            attrs = self.extract_attributes_llm_safe(name, full_description)
-
-            if attrs:
-                with self.driver.session() as session:
+                attrs = self.extract_attributes_llm_safe(name, full_desc)
+                if attrs:
                     for prod in attrs.get('products', []):
                         session.run(
                             "MATCH (c:Company {ticker:$t}) MERGE (p:Product {name:$n}) MERGE (c)-[:PRODUCES]->(p)",
@@ -239,7 +211,7 @@ class BaseGraphBuilder:
                             t=ticker, n=res)
 
     def build_vector_index(self):
-        print("\nСоздание векторного индекса (Rich Embeddings)...")
+        print("\nСоздание векторного индекса...")
         target_labels = ["Company", "Fund", "Industry", "City", "Country", "State"]
 
         with self.driver.session() as session:
@@ -264,9 +236,7 @@ class BaseGraphBuilder:
                 desc_parts = []
                 if record.get('desc'): desc_parts.append(str(record['desc'])[:300])
                 if record.get('wiki'): desc_parts.append(str(record['wiki'])[:300])
-
-                if desc_parts:
-                    text += " - " + " ".join(desc_parts)
+                if desc_parts: text += " - " + " ".join(desc_parts)
 
                 vec = self._get_vector(text)
                 session.run("MATCH (n) WHERE elementId(n)=$id CALL db.create.setNodeVectorProperty(n, 'embedding', $v)",
@@ -311,11 +281,23 @@ class BaseGraphBuilder:
 
             return None
 
+    @retry(max_retries=3, delay=1)
+    def analyze_news_llm_safe(self, headline):
+        prompt = f"""
+        Analyze news: "{headline}"
+        Task: Extract MAIN entities (Companies, Funds, Locations, Industries). Ignore people.
+        Determine Sentiment (-1.0 to 1.0).
+        Return JSON: {{ "entities": ["Name1", "Name2"], "sentiment": 0.5 }}
+        """
+        resp = self.client.chat.completions.create(model='qwen/qwen-2.5-7b-instruct',
+                                                   messages=[{'role': 'user', 'content': prompt}], temperature=0.0)
+        txt = resp.choices[0].message.content.replace("```json", "").replace("```", "").strip()
+        if "{" in txt: txt = txt[txt.find("{"):txt.rfind("}") + 1]
+        return json.loads(txt)
+
     def process_news(self):
         print(f"\nОбработка новостей из {NEWS_CSV_PATH}...")
-        if not os.path.exists(NEWS_CSV_PATH):
-            print("Файл новостей не найден")
-            return
+        if not os.path.exists(NEWS_CSV_PATH): return
         df = pd.read_csv(NEWS_CSV_PATH)
 
         with self.driver.session() as session:
@@ -350,7 +332,7 @@ class BaseGraphBuilder:
         self.process_companies()
         self.build_vector_index()
         self.process_news()
-        print("\nБазовый граф готов")
+        print("\nБазовый граф готов.")
 
 
 if __name__ == "__main__":
