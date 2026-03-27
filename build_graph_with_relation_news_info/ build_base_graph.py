@@ -47,6 +47,20 @@ NEWS_CSV_PATH = '../data/classified_reuters_news_mapped.csv'
 
 THRESHOLD_MIN_CHECK = 0.70
 
+NEWS_RELATION_BY_LABEL = {
+    "Company": "NEWS_ABOUT_COMPANY",
+    "Fund": "NEWS_ABOUT_FUND",
+    "City": "NEWS_ABOUT_LOCATION",
+    "State": "NEWS_ABOUT_LOCATION",
+    "Country": "NEWS_ABOUT_LOCATION",
+    "Sector": "NEWS_ABOUT_SECTOR",
+    "Industry": "NEWS_ABOUT_INDUSTRY",
+    "Product": "NEWS_ABOUT_PRODUCT",
+    "Resource": "NEWS_ABOUT_RESOURCE",
+}
+
+SUPPORTED_NEWS_ENTITY_LABELS = tuple(NEWS_RELATION_BY_LABEL.keys())
+
 
 class BaseGraphBuilder:
     def __init__(self):
@@ -89,7 +103,7 @@ class BaseGraphBuilder:
             except:
                 pass
 
-            for label in ["Person", "Product", "Resource", "News", "Fund", "City", "State", "Country"]:
+            for label in ["Person", "Product", "Resource", "News", "Fund", "City", "State", "Country", "Sector", "Industry"]:
                 try:
                     session.run(f"CREATE INDEX {label.lower()}_name IF NOT EXISTS FOR (n:{label}) ON (n.name)")
                 except:
@@ -212,7 +226,17 @@ class BaseGraphBuilder:
 
     def build_vector_index(self):
         print("\nСоздание векторного индекса...")
-        target_labels = ["Company", "Fund", "Industry", "City", "Country", "State"]
+        target_labels = [
+            "Company",
+            "Fund",
+            "Sector",
+            "Industry",
+            "City",
+            "State",
+            "Country",
+            "Product",
+            "Resource",
+        ]
 
         with self.driver.session() as session:
             session.run(f"MATCH (n) WHERE any(l in labels(n) WHERE l IN {json.dumps(target_labels)}) SET n:Searchable")
@@ -254,7 +278,7 @@ class BaseGraphBuilder:
                 time.sleep(1)
             print("Индекс готов.")
 
-    def find_node(self, text_query):
+    def find_node(self, text_query, allowed_labels=None):
         if not text_query: return None
         vec = self._get_vector(text_query)
         with self.driver.session() as session:
@@ -266,11 +290,18 @@ class BaseGraphBuilder:
             if not res: return None
 
             candidates = []
+            normalized_allowed_labels = set(allowed_labels or [])
+
             for r in res:
                 name = r['node'].get('name', '')
                 lbl = [l for l in r['lbl'] if l != 'Searchable'][0]
+                if normalized_allowed_labels and lbl not in normalized_allowed_labels:
+                    continue
                 ts = fuzz.token_sort_ratio(text_query.lower(), name.lower())
                 candidates.append({'node': r['node'], 'score': r['score'], 'ts': ts, 'label': lbl, 'name': name})
+
+            if not candidates:
+                return None
 
             best = max(candidates, key=lambda x: x['score'] + (0.05 if x['label'] == 'Company' else 0))
 
@@ -285,15 +316,75 @@ class BaseGraphBuilder:
     def analyze_news_llm_safe(self, headline):
         prompt = f"""
         Analyze news: "{headline}"
-        Task: Extract MAIN entities (Companies, Funds, Locations, Industries). Ignore people.
+        Task: Extract MAIN entities with their type.
+        Allowed types: Company, Fund, City, State, Country, Sector, Industry, Product, Resource.
+        Do not extract Person entities because person names are often abbreviated or ambiguous in headlines.
+        Include only entities that are really central to the news.
+        Use the exact type only when you are confident, because downstream matching will only search inside that entity type.
         Determine Sentiment (-1.0 to 1.0).
-        Return JSON: {{ "entities": ["Name1", "Name2"], "sentiment": 0.5 }}
+        Return JSON: {{
+          "entities": [
+            {{"name": "Name1", "type": "Company"}},
+            {{"name": "Name2", "type": "Country"}}
+          ],
+          "sentiment": 0.5
+        }}
         """
         resp = self.client.chat.completions.create(model='qwen/qwen-2.5-7b-instruct',
                                                    messages=[{'role': 'user', 'content': prompt}], temperature=0.0)
         txt = resp.choices[0].message.content.replace("```json", "").replace("```", "").strip()
         if "{" in txt: txt = txt[txt.find("{"):txt.rfind("}") + 1]
         return json.loads(txt)
+
+    def _normalize_news_entities(self, entities):
+        normalized = []
+        if not isinstance(entities, list):
+            return normalized
+
+        for ent in entities:
+            if isinstance(ent, dict):
+                name = str(ent.get("name", "")).strip()
+                label = str(ent.get("type", "")).strip()
+            else:
+                name = str(ent).strip()
+                label = ""
+
+            if not name:
+                continue
+
+            if label and label not in SUPPORTED_NEWS_ENTITY_LABELS:
+                continue
+
+            normalized.append({"name": name, "type": label})
+
+        return normalized
+
+    def _match_news_entity(self, raw_entity):
+        raw_name = raw_entity.get("name", "")
+        preferred_type = raw_entity.get("type", "")
+        allowed_labels = [preferred_type] if preferred_type else None
+
+        match = self.find_node(raw_name, allowed_labels=allowed_labels)
+        if not match:
+            return None
+
+        return match
+
+    def _deduplicate_news_entities(self, matches):
+        unique_matches = []
+        seen = set()
+
+        for match in matches:
+            key = (match["label"], match["key"], match["id"])
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_matches.append(match)
+
+        return unique_matches
+
+    def _news_relation_type_for_label(self, label):
+        return NEWS_RELATION_BY_LABEL.get(label, "MENTIONS")
 
     def process_news(self):
         print(f"\nОбработка новостей из {NEWS_CSV_PATH}...")
@@ -313,19 +404,27 @@ class BaseGraphBuilder:
                 if not an: continue
 
                 found = []
-                for raw_ent in an.get('entities', []):
-                    match = self.find_node(raw_ent)
-                    if match: found.append(match)
+                for raw_ent in self._normalize_news_entities(an.get('entities', [])):
+                    match = self._match_news_entity(raw_ent)
+                    if match:
+                        found.append(match)
+
+                found = self._deduplicate_news_entities(found)
 
                 if not found: continue
 
                 for ent in found:
+                    rel_type = self._news_relation_type_for_label(ent['label'])
                     session.run(f"""
                         MATCH (e:{ent['label']} {{ {ent['key']}: $eid }})
                         MERGE (n:News {{headline: $hl, date: date($dt)}})
                         SET n.sentiment = $sent
-                        MERGE (n)-[:MENTIONS]->(e)
-                    """, eid=ent['id'], hl=headline, dt=iso_date, sent=an.get('sentiment', 0))
+                        MERGE (n)-[r:{rel_type}]->(e)
+                        SET r.entity_type = $entity_type,
+                            r.entity_label = $entity_label
+                    """, eid=ent['id'], hl=headline, dt=iso_date, sent=an.get('sentiment', 0),
+                         entity_type=("Location" if ent['label'] in {"City", "State", "Country"} else ent['label']),
+                         entity_label=ent['label'])
 
     def run(self):
         self.reset_db()
