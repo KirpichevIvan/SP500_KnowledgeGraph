@@ -16,3 +16,4 @@ services:
     volumes:
       - ./neo4j_data:/data
       - ./plugins:/plugins
+      - ./neo4j_import:/import
